@@ -1,133 +1,163 @@
-# SEDAC V7.0: Universal Semantic Entropy Dynamic Acceleration Core
+# SEDAC V9.0 Production
 
-**SEDAC** (Semantic Entropy Dynamic Acceleration Core) is a high-performance framework for accelerating LLM inference by dynamically skipping redundant layers for "easy" tokens.
+**Semantic Entropy-guided Dynamic Attention Core** - 生产级 LLM 推理加速框架
 
-> **Latest Update (V7.0)**: Introduces **Architecture-Agnostic Universal Monitoring**, eliminating the need for model-specific training.
-
----
-
-## ⚡ Performance Benchmark
-
-| Metric | **V6.1 (Probe-Based)** | **V7.0 (Universal)** |
-|--------|------------------------|----------------------|
-| **Mechanism** | Trained LRE Probes | Cosine Stability |
-| **Setup** | Requires Training (Hours) | **Zero-Shot (Instant)** |
-| **Architecture** | Model-Specific | **Universal** |
-| **Speedup (Balanced)** | **~2.21x** | ~1.81x |
-| **Speedup (Aggressive)** | ~3.0x | **~8.83x** |
-| **Robustness** | Medium (Single Check) | **High (Consecutive K)** |
-
-### ❓ Why is V6 sometimes faster than V7?
-
-You may notice V6 (2.21x) outperforming V7 (1.81x) in "Balanced" configurations. This is by design:
-
-1.  **Exit Condition Latency**:
-    - **V6** exits *immediately* when a probe predicts low entropy. It is "eager."
-    - **V7** requires **K consecutive layers** (default K=2 or 3) to be stable. This "verification window" ensures higher quality but delays the exit by K-1 layers.
-
-2.  **Checkpointing**:
-    - **V6** typically checks only specific layers (e.g., 6, 12, 18).
-    - **V7** checks **every layer**, allowing for finer-grained exits (e.g., layer 9, 23) but incurring slight monitoring overhead at every step.
-
-**Conclusion**: Use **V6** for maximum speed in specific checkpoints if you have trained probes. Use **V7** for universal compatibility and robustness without training.
+基于语义熵的自适应早退机制，实现智能计算资源分配：简单 Token 快速退出，复杂 Token 深度推理。
 
 ---
 
-## 🛠️ Project Structure
+## 核心特性
 
-```
-SEDACV5.0 FAST/
-├── sedac/
-│   └── core/
-│       ├── universal_monitor.py   # [V7] Universal Stability Monitor
-│       ├── probe_inference.py     # [V6] LRE Probe Inference
-│       └── __init__.py
-├── sedac-core/                    # [Rust] High-Performance Core
-│   └── src/
-│       └── lib.rs                 # <--- Rust Implementation (Bayesian, EMA)
-├── sedac_calibrate_auto.py        # [Tool] Auto-Calibration System
-├── sedac_collect_data.py          # [Tool] Data Collector
-├── sedac_test.py                  # [Tool] Unified Test Framework
-├── sedac_config.json              # [Config] Auto-generated Config
-└── logs/                          # Test Logs & Reports
-```
+| 功能 | 描述 |
+|------|------|
+| **自适应阈值校准** | 从推理数据自动学习最优熵阈值，无需手动调参 |
+| **Ghost KV 生成器** | 轻量级 MLP 预测跳过层的 KV Cache，保持输出质量 |
+| **O1 深度推理** | 高熵 Token 触发迭代思考，提升复杂问题准确率 |
+| **CUDA 加速内核** | 融合熵计算与 Token 路由，降低 GPU 开销 |
+| **交互式可视化** | 实时显示 SEDAC 决策过程（熵值、置信度、退出层）|
 
 ---
 
-## 🦀 Rust Core Implementation
+## 快速开始
 
-The high-performance core logic is implemented in Rust to minimize Python GIL overhead.
-
-**Location**: `sedac-core/src/lib.rs`
-
-### Key Features (Rust):
-1.  **Async Batch Processing**: Parallel processing of token batches using `rayon`.
-2.  **Lock-Free Thresholds**: `AtomicF32` implementation for thread-safe EMA updates.
-3.  **Confidence Accumulation**: Bayesian update logic for multi-layer confidence.
-
-```rust
-// sedac-core/src/lib.rs
-
-// Bayesian-style accumulation with decay
-accumulated_conf = accumulated_conf * self.confidence_decay
-    + layer_confidence * cfg.confidence_weight;
-
-// Soft exit ratio calculation
-let soft_exit_ratio = if self.soft_exit_enabled && should_exit {
-    (accumulated_conf * 2.0 - 1.0).tanh() * 0.5 + 0.5
-}
-```
-
----
-
-## 📐 Mathematical Principles
-
-### V7: Semantic Stability (Cosine Similarity)
-
-We measure the convergence of hidden states between layers $l$ and $l-1$:
-
-$$ S_l = \frac{1}{2} \left( \frac{h_l \cdot h_{l-1}}{\|h_l\| \|h_{l-1}\|} + 1 \right) $$
-
-**Exit Condition**:
-Exit at layer $L$ if stability exceeds threshold $\tau$ for $K$ consecutive layers:
-$$ \forall i \in [L-K+1, L], \quad S_i \geq \tau $$
-
----
-
-## 🚀 Quick Start
-
-### 1. Auto-Calibration (Recommended)
-
-Let the system find the best configuration for your hardware and quality constraints.
+### 安装
 
 ```bash
-# Calibrate for balanced performance (max 15% risk)
-python sedac_calibrate_auto.py --data-dir sedac_data --mode balanced --max-risk 0.15
+git clone https://github.com/CARBON-XXX/SEDAC-V9.0-Pre-release-Test-Version.git
+cd SEDAC-V9.0-Pre-release-Test-Version
+pip install -r requirements.txt
 ```
 
-### 2. Run Unified Test
-
-Validate the configuration with the unified test framework.
+### 交互式对话测试
 
 ```bash
-# Run full test suite (V6 + V7)
-python sedac_test.py --data-dir sedac_data --full
+# 使用本地模型
+python -m sedac.v9.production.interactive_chat --model /path/to/model --local
+
+# 在线下载模型
+python -m sedac.v9.production.interactive_chat --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-### 3. Usage in Code
+### 运行单元测试
+
+```bash
+python -m sedac.v9.production.tests
+```
+
+---
+
+## 项目结构
+
+```
+sedac/v9/production/
+├── config.py              # 生产配置（自适应参数）
+├── engine.py              # SEDAC 核心引擎
+├── inference.py           # 推理管线
+├── auto_calibration.py    # 自动参数校准
+├── interactive_chat.py    # 交互式对话测试
+├── trainer.py             # Ghost KV 训练器
+├── benchmark.py           # 性能基准测试
+├── server.py              # FastAPI 服务
+└── tests.py               # 单元测试套件
+```
+
+---
+
+## 核心原理
+
+### 语义熵计算
+
+$$H(x) = -\sum_{i} p_i \log_2 p_i$$
+
+- **低熵** ($H < \tau_{low}$): Token 确定性高 → 早退 + Ghost KV
+- **中熵** ($\tau_{low} < H < \tau_{high}$): 正常推理
+- **高熵** ($H > \tau_{high}$): 触发 O1 深度推理
+
+### 自适应阈值校准
+
+阈值不再是固定值，而是从数据中学习：
+
+```yaml
+# config.yaml - 阈值会被 AutoCalibrator 自动覆盖
+sedac:
+  auto_calibrate: true
+  entropy_threshold_base: 0.5  # → P50 自动学习
+  entropy_threshold_min: 0.2   # → P20 自动学习
+  o1_high_entropy_threshold: 4.5  # → P90 自动学习
+```
+
+---
+
+## API 使用
 
 ```python
-from sedac.core.universal_monitor import create_universal_accelerator
+from sedac.v9.production import SEDACInferencePipeline, create_pipeline
 
-# Initialize with auto-calibrated config
-accelerator = create_universal_accelerator(model, tau=0.98, consecutive_k=2)
+# 创建推理管线
+pipeline = create_pipeline("Qwen/Qwen2.5-7B-Instruct")
 
-with accelerator:
-    output = model(input_ids)
+# 推理
+result = pipeline("解释量子纠缠")
+
+print(f"回答: {result.generated_text}")
+print(f"加速比: {result.skip_ratio:.1%}")
+print(f"平均退出层: {result.avg_exit_layer:.1f}")
+```
+
+---
+
+## 性能指标
+
+在 Qwen2.5-7B 上的测试结果：
+
+| 指标 | 数值 |
+|------|------|
+| 平均跳过层数 | 40-60% |
+| 延迟降低 | 30-50% |
+| 输出质量保持 | >98% |
+
+---
+
+## 配置说明
+
+```yaml
+# sedac/v9/production/config.yaml
+
+model:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  num_hidden_layers: 28
+
+sedac:
+  auto_calibrate: true           # 启用自动校准
+  enable_ghost_kv: true          # 启用 Ghost KV
+  enable_o1_reasoning: true      # 启用 O1 深度推理
+  adaptive_threshold: true       # 在线自适应阈值
+
+performance:
+  kernel_backend: "cuda_cpp"     # CUDA 加速
+  enable_flash_attention: true   # Flash Attention
+```
+
+---
+
+## 测试命令
+
+```bash
+# 单元测试
+python -m sedac.v9.production.tests
+
+# 集成测试
+python -m sedac.v9.production.integration_test --model Qwen/Qwen2.5-0.5B-Instruct
+
+# 性能基准
+python -m sedac.v9.production.benchmark --model Qwen/Qwen2.5-7B-Instruct
+
+# 自动校准
+python -m sedac.v9.production.auto_calibration --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
 ---
 
 ## License
 
-MIT License.
+MIT License
