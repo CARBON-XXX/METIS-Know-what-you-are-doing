@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from collections import deque
 import json
@@ -125,7 +125,8 @@ class AutoCalibrator:
     校准策略:
     1. 收集推理样本的熵/置信度分布
     2. 基于分布百分位确定阈值
-    3. 持续在线更新
+    3. 通过 A/B 测试验证参数质量
+    4. 持续在线更新
     """
     
     def __init__(
@@ -212,6 +213,7 @@ class AutoCalibrator:
         
         recent = list(self._online_buffer)
         entropy_arr = np.array([x[0] for x in recent])
+        conf_arr = np.array([x[1] for x in recent])
         
         alpha = 0.1
         
@@ -374,6 +376,7 @@ def calibrate_for_model(
         校准后的参数
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
     
     logger.info(f"Loading model: {model_name}")
     

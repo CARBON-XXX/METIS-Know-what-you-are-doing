@@ -9,10 +9,17 @@ import time
 import sys
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.live import Live
+from rich.layout import Layout
+from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn
 import logging
 
+console = Console()
 logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,6 +30,7 @@ class SEDACStepInfo:
     confidence: float
     threshold: float
     decision: str  # "continue", "exit", "thinking"
+    skip_layers: int = 0
     ghost_kv_used: bool = False
 
 
@@ -43,20 +51,75 @@ class SEDACTokenTrace:
         return 1.0 - self.exit_layer / self.total_layers
 
 
-def colorize(text: str, color: str) -> str:
-    """简单终端着色"""
-    colors = {
-        "green": "\033[92m",
-        "yellow": "\033[93m",
-        "red": "\033[91m",
-        "cyan": "\033[96m",
-        "blue": "\033[94m",
-        "magenta": "\033[95m",
-        "bold": "\033[1m",
-        "dim": "\033[2m",
-        "reset": "\033[0m",
-    }
-    return f"{colors.get(color, '')}{text}{colors['reset']}"
+class SEDACVisualizer:
+    """SEDAC 可视化器"""
+    
+    def __init__(self, total_layers: int = 28):
+        self.total_layers = total_layers
+        self.console = Console()
+    
+    def render_entropy_bar(self, entropy: float, max_entropy: float = 10.0) -> str:
+        """渲染熵值条"""
+        ratio = min(entropy / max_entropy, 1.0)
+        filled = int(ratio * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        
+        if entropy < 3.0:
+            color = "green"
+        elif entropy < 5.0:
+            color = "yellow"
+        else:
+            color = "red"
+        
+        return f"[{color}]{bar}[/{color}] {entropy:.2f}"
+    
+    def render_layer_progress(self, exit_layer: int) -> str:
+        """渲染层进度"""
+        ratio = exit_layer / self.total_layers
+        filled = int(ratio * 20)
+        bar = "▓" * filled + "░" * (20 - filled)
+        
+        if ratio < 0.5:
+            color = "green"
+        elif ratio < 0.75:
+            color = "yellow"
+        else:
+            color = "cyan"
+        
+        return f"[{color}]{bar}[/{color}] {exit_layer}/{self.total_layers}"
+    
+    def render_decision(self, decision: str) -> str:
+        """渲染决策"""
+        if decision == "exit":
+            return "[green]⚡ EXIT[/green]"
+        elif decision == "thinking":
+            return "[yellow]🤔 THINKING[/yellow]"
+        else:
+            return "[cyan]→ CONTINUE[/cyan]"
+    
+    def create_token_panel(self, trace: SEDACTokenTrace) -> Panel:
+        """创建 Token 面板"""
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Key", style="dim")
+        table.add_column("Value")
+        
+        table.add_row("Token", f"[bold]{trace.token_text}[/bold]")
+        table.add_row("Layer", self.render_layer_progress(trace.exit_layer))
+        
+        if trace.steps:
+            last_step = trace.steps[-1]
+            table.add_row("Entropy", self.render_entropy_bar(last_step.entropy))
+            table.add_row("Confidence", f"{last_step.confidence:.2%}")
+            table.add_row("Decision", self.render_decision(last_step.decision))
+            
+            if last_step.ghost_kv_used:
+                table.add_row("Ghost KV", "[magenta]✓ Used[/magenta]")
+        
+        skip_pct = trace.skip_ratio * 100
+        table.add_row("Skip", f"[bold green]{skip_pct:.1f}%[/bold green]")
+        table.add_row("Time", f"{trace.generation_time_ms:.1f}ms")
+        
+        return Panel(table, title=f"Token #{trace.token_id}", border_style="blue")
 
 
 class InteractiveSEDACChat:
@@ -64,11 +127,6 @@ class InteractiveSEDACChat:
     交互式 SEDAC 对话
     
     实时显示每个 Token 生成时 SEDAC 的决策过程
-    
-    支持:
-    - 本地模型路径 (避免网络问题)
-    - 离线模式
-    - 自动校准
     """
     
     def __init__(
@@ -76,58 +134,41 @@ class InteractiveSEDACChat:
         model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
         device: str = "cuda",
         verbose: bool = True,
-        local_files_only: bool = False,  # 支持离线模式
     ):
         self.model_name = model_name
         self.device = device
         self.verbose = verbose
-        self.local_files_only = local_files_only
         
         self.model = None
         self.tokenizer = None
         self.sedac_engine = None
-        self.calibrator = None
+        self.visualizer = None
         
         self.token_traces: List[SEDACTokenTrace] = []
     
     def setup(self) -> bool:
         """初始化模型和 SEDAC"""
-        print(colorize("Loading model and SEDAC engine...", "bold"))
+        console.print("[bold]Loading model and SEDAC engine...[/bold]")
         
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             from .config import ProductionConfig
             from .engine import ProductionSEDACEngine
-            from .auto_calibration import AutoCalibrator
             
-            print(f"  Loading tokenizer from {colorize(self.model_name, 'cyan')}...")
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_name, 
-                    trust_remote_code=True,
-                    local_files_only=self.local_files_only,
-                )
-            except Exception as e:
-                print(colorize(f"  Failed to load tokenizer: {e}", "yellow"))
-                print(colorize("  Tip: Use --local if model is cached, or specify local path", "dim"))
-                raise
-            
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, 
+                trust_remote_code=True
+            )
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            print(f"  Loading model {colorize(self.model_name, 'cyan')}...")
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    device_map="auto" if self.device == "cuda" else None,
-                    trust_remote_code=True,
-                    local_files_only=self.local_files_only,
-                )
-            except Exception as e:
-                print(colorize(f"  Failed to load model: {e}", "yellow"))
-                print(colorize("  Tip: Ensure model is downloaded or use local path", "dim"))
-                raise
+            console.print(f"  Loading [cyan]{self.model_name}[/cyan]...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                device_map="auto" if self.device == "cuda" else None,
+                trust_remote_code=True,
+            )
             
             config = ProductionConfig()
             config.device = self.device
@@ -141,18 +182,14 @@ class InteractiveSEDACChat:
             except:
                 pass
             
-            self.calibrator = AutoCalibrator(model_layers=config.model.num_hidden_layers)
-            
             self.sedac_engine = ProductionSEDACEngine(config)
+            self.visualizer = SEDACVisualizer(config.model.num_hidden_layers)
             
-            print(colorize("✓ Setup complete!", "green"))
-            print(colorize("✓ Auto-calibration enabled - thresholds will adapt automatically", "cyan"))
+            console.print("[green]✓ Setup complete![/green]")
             return True
             
         except Exception as e:
-            print(colorize(f"Setup failed: {e}", "red"))
-            import traceback
-            traceback.print_exc()
+            console.print(f"[red]Setup failed: {e}[/red]")
             return False
     
     @torch.no_grad()
@@ -165,15 +202,14 @@ class InteractiveSEDACChat:
         
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device)
+        attention_mask = inputs.attention_mask.to(self.device)
         
         traces = []
         generated_ids = input_ids.clone()
         
         total_layers = self.sedac_engine.config.model.num_hidden_layers
         
-        print(f"\n{colorize('═══ SEDAC Generation Trace ═══', 'cyan')}\n")
-        print(f"{'#':>4} {'Token':<12} {'Entropy':>8} {'Conf':>6} {'Layer':>10} {'Bar':<12} {'Decision':<10} {'Time':>8}")
-        print("-" * 80)
+        console.print("\n[bold cyan]═══ SEDAC Generation Trace ═══[/bold cyan]\n")
         
         for step in range(max_new_tokens):
             start_time = time.perf_counter()
@@ -205,13 +241,6 @@ class InteractiveSEDACChat:
             else:
                 decision = "continue"
                 exit_layer = total_layers
-            
-            self.calibrator.record_sample(
-                entropy=entropy_val,
-                confidence=conf_val,
-                exit_layer=exit_layer,
-                quality=1.0,
-            )
             
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
             token_text = self.tokenizer.decode(next_token[0])
@@ -254,32 +283,25 @@ class InteractiveSEDACChat:
         if not step:
             return
         
-        token_display = trace.token_text.replace("\n", "↵").replace("\t", "→")
-        if len(token_display) > 10:
-            token_display = token_display[:10] + ".."
+        token_display = trace.token_text.replace("\n", "↵")
+        if len(token_display) > 8:
+            token_display = token_display[:8] + "..."
         
-        if step.entropy < 3.0:
-            entropy_color = "green"
-        elif step.entropy < 5.0:
-            entropy_color = "yellow"
-        else:
-            entropy_color = "red"
+        entropy_color = "green" if step.entropy < 3.0 else ("yellow" if step.entropy < 5.0 else "red")
+        decision_icon = {"exit": "⚡", "thinking": "🤔", "continue": "→"}[step.decision]
         
-        decision_icons = {"exit": "⚡EXIT", "thinking": "🤔THINK", "continue": "→CONT"}
-        decision_display = decision_icons.get(step.decision, step.decision)
+        layer_bar = "▓" * (trace.exit_layer * 10 // trace.total_layers)
+        layer_bar += "░" * (10 - len(layer_bar))
         
-        bar_len = trace.exit_layer * 10 // trace.total_layers
-        layer_bar = "▓" * bar_len + "░" * (10 - bar_len)
-        
-        print(
-            f"{trace.token_id:>4} "
-            f"{token_display:<12} "
-            f"{colorize(f'{step.entropy:>7.2f}', entropy_color)} "
-            f"{step.confidence:>5.0%} "
-            f"{trace.exit_layer:>3}/{trace.total_layers:<3} "
-            f"{colorize(layer_bar, 'cyan')} "
-            f"{decision_display:<10} "
-            f"{trace.generation_time_ms:>6.1f}ms"
+        console.print(
+            f"[dim]#{trace.token_id:3d}[/dim] "
+            f"[bold]{token_display:10s}[/bold] "
+            f"[{entropy_color}]H={step.entropy:5.2f}[/{entropy_color}] "
+            f"C={step.confidence:.0%} "
+            f"L={trace.exit_layer:2d}/{trace.total_layers} "
+            f"[cyan]{layer_bar}[/cyan] "
+            f"{decision_icon} "
+            f"[dim]{trace.generation_time_ms:5.1f}ms[/dim]"
         )
     
     def print_summary(self, traces: List[SEDACTokenTrace]) -> None:
@@ -295,35 +317,38 @@ class InteractiveSEDACChat:
         exit_decisions = sum(1 for t in traces if t.steps and t.steps[-1].decision == "exit")
         thinking_decisions = sum(1 for t in traces if t.steps and t.steps[-1].decision == "thinking")
         
-        print(f"\n{colorize('═══ SEDAC Summary ═══', 'cyan')}")
-        print(f"  Total Tokens:    {len(traces)}")
-        print(f"  Avg Exit Layer:  {avg_exit:.1f} / {traces[0].total_layers}")
-        print(f"  Avg Skip Ratio:  {colorize(f'{avg_skip*100:.1f}%', 'green')}")
-        print(f"  Early Exits:     {exit_decisions} ({exit_decisions/len(traces)*100:.1f}%)")
-        print(f"  Deep Thinking:   {thinking_decisions} ({thinking_decisions/len(traces)*100:.1f}%)")
-        print(f"  Avg Time/Token:  {avg_time:.1f}ms")
-        print(f"  Total Time:      {total_time:.1f}ms")
-        print(f"  TPS:             {len(traces) / (total_time/1000):.1f}")
+        table = Table(title="SEDAC Summary", show_header=True)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
         
-        if self.calibrator.is_calibrated:
-            params = self.calibrator.get_calibrated_params()
-            print(f"\n{colorize('═══ Calibrated Parameters ═══', 'magenta')}")
-            print(f"  Entropy Base:    {params.entropy_threshold_base:.3f} (auto-learned)")
-            print(f"  O1 Threshold:    {params.o1_high_entropy_threshold:.2f} (auto-learned)")
-            print(f"  Min Exit Layer:  {params.min_exit_layer} (auto-learned)")
+        table.add_row("Total Tokens", str(len(traces)))
+        table.add_row("Avg Exit Layer", f"{avg_exit:.1f} / {traces[0].total_layers}")
+        table.add_row("Avg Skip Ratio", f"{avg_skip*100:.1f}%")
+        table.add_row("Early Exits", f"{exit_decisions} ({exit_decisions/len(traces)*100:.1f}%)")
+        table.add_row("Deep Thinking", f"{thinking_decisions} ({thinking_decisions/len(traces)*100:.1f}%)")
+        table.add_row("Avg Time/Token", f"{avg_time:.1f}ms")
+        table.add_row("Total Time", f"{total_time:.1f}ms")
+        table.add_row("TPS", f"{len(traces) / (total_time/1000):.1f}")
+        
+        console.print("\n")
+        console.print(table)
     
     def chat_loop(self) -> None:
         """交互式对话循环"""
-        print(f"\n{colorize('╔══════════════════════════════════════════════╗', 'cyan')}")
-        print(f"{colorize('║', 'cyan')}   SEDAC V9.0 Interactive Chat                {colorize('║', 'cyan')}")
-        print(f"{colorize('║', 'cyan')}   Commands: /quit, /stats, /clear, /params   {colorize('║', 'cyan')}")
-        print(f"{colorize('╚══════════════════════════════════════════════╝', 'cyan')}\n")
+        console.print(Panel.fit(
+            "[bold cyan]SEDAC V9.0 Interactive Chat[/bold cyan]\n\n"
+            "Commands:\n"
+            "  [green]/quit[/green]  - Exit\n"
+            "  [green]/stats[/green] - Show session statistics\n"
+            "  [green]/clear[/green] - Clear history\n",
+            title="Welcome",
+        ))
         
         session_traces = []
         
         while True:
             try:
-                user_input = input(f"\n{colorize('You:', 'green')} ").strip()
+                user_input = console.input("\n[bold green]You:[/bold green] ").strip()
             except (KeyboardInterrupt, EOFError):
                 break
             
@@ -337,39 +362,29 @@ class InteractiveSEDACChat:
                 continue
             elif user_input.lower() == "/clear":
                 session_traces.clear()
-                print(colorize("Session cleared.", "dim"))
-                continue
-            elif user_input.lower() == "/params":
-                if self.calibrator.is_calibrated:
-                    params = self.calibrator.get_calibrated_params()
-                    print(f"\n{colorize('Current Calibrated Parameters:', 'magenta')}")
-                    import json
-                    print(json.dumps(params.to_dict(), indent=2))
-                else:
-                    print(colorize("Not yet calibrated. Generate more tokens.", "yellow"))
+                console.print("[dim]Session cleared.[/dim]")
                 continue
             
             response, traces = self.generate_with_trace(user_input)
             session_traces.extend(traces)
             
-            print(f"\n{colorize('Assistant:', 'blue')} {response}")
+            console.print(f"\n[bold blue]Assistant:[/bold blue] {response}")
             self.print_summary(traces)
         
-        print(colorize("\nGoodbye!", "dim"))
+        console.print("\n[dim]Goodbye![/dim]")
 
 
 def run_interactive_chat(
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
     device: str = "cuda",
-    local_files_only: bool = False,
 ) -> None:
     """运行交互式对话"""
     
     if not torch.cuda.is_available() and device == "cuda":
-        print(colorize("CUDA not available, using CPU", "yellow"))
+        console.print("[yellow]CUDA not available, using CPU[/yellow]")
         device = "cpu"
     
-    chat = InteractiveSEDACChat(model_name, device, local_files_only=local_files_only)
+    chat = InteractiveSEDACChat(model_name, device)
     
     if not chat.setup():
         return
@@ -381,12 +396,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="SEDAC Interactive Chat")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
-                       help="Model name or local path")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device: cuda or cpu")
-    parser.add_argument("--local", action="store_true",
-                       help="Use local files only (offline mode)")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--device", type=str, default="cuda")
     
     args = parser.parse_args()
-    run_interactive_chat(args.model, args.device, args.local)
+    run_interactive_chat(args.model, args.device)
