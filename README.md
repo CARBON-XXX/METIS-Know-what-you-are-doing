@@ -159,5 +159,4 @@ python -m sedac.v9.production.auto_calibration --model Qwen/Qwen2.5-0.5B-Instruc
 ---
 
 ## License
-
-MIT License
+Apache-2.0 许可证
