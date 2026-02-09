@@ -221,6 +221,21 @@ class MetisInference:
             if self._cot_manager.should_inject() and not is_thinking:
                 strategy = self._cot_manager.select_strategy(signal)
 
+                # CRITICAL: Check for existing repetition before starting thinking.
+                # If model is already looping, we MUST trim the tail, otherwise
+                # the loop remains in context and contaminates the thinking block.
+                max_window = min(len(generated_tokens) // 2, 256)
+                rep_len, _ = self._detect_repetition_hybrid(
+                    generated_tokens, max_window
+                )
+                if rep_len > 0:
+                    logger.info(
+                        f"[METIS] Pre-CoT Repetition Trim: removed {rep_len} tokens"
+                    )
+                    generated_tokens = generated_tokens[:-rep_len]
+                    # Clear viz buffer to remove visual garbage
+                    vis_buffer.clear()
+
                 # Open <thinking> tag — model continues from here on its own
                 think_open = "\n<thinking>\n"
                 think_open_ids = tokenizer.encode(think_open, add_special_tokens=False)
@@ -619,10 +634,11 @@ class MetisInference:
         n = len(tokens)
         
         # 1. Check Long Semantic Loops (Jaccard)
-        # Scan strategic large windows
-        jaccard_windows = [32, 48, 64, 96, 128, 192, 256]
-        for w in jaccard_windows:
-            if w > max_window or n < 2 * w:
+        # Dense scan for Jaccard to catch arbitrary loop lengths
+        # Step size 4 is granular enough for bag-of-words
+        # Range: [16, max_window]
+        for w in range(16, max_window + 1, 4):
+            if n < 2 * w:
                 continue
             
             set_a = set(tokens[n - 2 * w : n - w])
@@ -635,12 +651,16 @@ class MetisInference:
             union = len(set_a | set_b)
             jaccard = intersection / union
             
-            if jaccard >= 0.6:
+            # Lower threshold to 0.55 to be more aggressive against semantic loops
+            if jaccard >= 0.55:
+                # Log the detection for debugging
+                if w > 32: # Only log significant semantic loops
+                     logger.debug(f"[METIS] Jaccard match: w={w}, score={jaccard:.2f}")
                 return w, jaccard
 
         # 2. Check Short Exact/Near-Exact Loops (Positional)
-        # Dense scan downwards from 31 to 4
-        for w in range(min(max_window, 31), 3, -1):
+        # Dense scan downwards from 15 to 4 (very short exact loops)
+        for w in range(min(max_window, 15), 3, -1):
             if n < 2 * w:
                 continue
                 
