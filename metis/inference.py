@@ -179,6 +179,14 @@ class MetisInference:
         thinking_start_step = 0 if is_thinking else -1
         min_thinking_tokens = 64  # Minimum thinking length (Anti-Lazy)
 
+        # Repetition detection state
+        repetition_events = 0
+        last_rep_check_step = 0
+        _REP_CHECK_INTERVAL = 20   # Check every N steps
+        _REP_CHECK_START = 40      # Start checking after N tokens
+        _REP_WINDOWS = [12, 24, 48, 80]  # Window sizes to scan
+        _REP_FORCE_STOP = 3        # Force stop after N repetition events
+
         # If thinking protocol enabled, write <thinking> tag to generated_tokens and notify callback
         if use_thinking_protocol:
             think_open = "<thinking>\n"
@@ -294,6 +302,81 @@ class MetisInference:
 
             if signal.boundary_action == BoundaryAction.HEDGE:
                 boundary_interventions += 1
+
+            # --- G5: Repetition Loop Detection & Intervention ---
+            # Detects when model is stuck repeating the same token sequence.
+            # LaTeX/math tokens have low entropy even during loops, so
+            # token-level signals alone cannot catch this.
+            if (
+                step >= _REP_CHECK_START
+                and step - last_rep_check_step >= _REP_CHECK_INTERVAL
+            ):
+                rep_len = self._detect_repetition(
+                    generated_tokens, _REP_WINDOWS
+                )
+                if rep_len > 0:
+                    repetition_events += 1
+                    last_rep_check_step = step
+                    logger.warning(
+                        f"[METIS] Repetition detected at step {step}: "
+                        f"pattern_len={rep_len}, event #{repetition_events}"
+                    )
+
+                    if repetition_events >= _REP_FORCE_STOP:
+                        # Escalation 3: Force stop — model is hopelessly stuck
+                        logger.warning(
+                            f"[METIS] Force stopping: {repetition_events} "
+                            f"repetition events"
+                        )
+                        # Trim the repeated tail
+                        generated_tokens = generated_tokens[:-rep_len]
+                        break
+
+                    if repetition_events >= 2 and not is_thinking:
+                        # Escalation 2: Trigger thinking to break the loop
+                        logger.info(
+                            "[METIS] Repetition -> triggering thinking "
+                            "to break loop"
+                        )
+                        # Trim repeated tail first
+                        generated_tokens = generated_tokens[:-rep_len]
+                        vis_buffer.clear()
+
+                        think_open = "\n<thinking>\n"
+                        think_open_ids = tokenizer.encode(
+                            think_open, add_special_tokens=False
+                        )
+                        for tid in think_open_ids:
+                            generated_tokens.append(tid)
+                        if self._on_token is not None:
+                            self._on_token(
+                                think_open,
+                                CognitiveSignal(
+                                    decision=Decision.DEEP,
+                                    introspection="[Thinking: repetition-break]",
+                                ),
+                            )
+                        open_input = torch.tensor(
+                            [think_open_ids], device=model.device
+                        )
+                        open_out = model(
+                            input_ids=open_input,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            return_dict=True,
+                        )
+                        past_key_values = open_out.past_key_values
+                        logits = open_out.logits[:, -1, :]
+                        is_thinking = True
+                        thinking_start_step = step
+                        cot_injected = True
+
+                    # Escalation 1: Apply n-gram penalty to logits
+                    # Penalize tokens that appeared in the repeated pattern
+                    rep_token_ids = generated_tokens[-rep_len:]
+                    unique_rep = set(rep_token_ids)
+                    for tid in unique_rep:
+                        logits[0, tid] -= 5.0  # Strong penalty
 
             # --- Token sampling (cognitive-aware) ---
             next_token_id = self._cognitive_sample(
@@ -508,6 +591,30 @@ class MetisInference:
             was_verified=was_verified,
             introspection="; ".join(introspection_parts),
         )
+
+    @staticmethod
+    def _detect_repetition(
+        tokens: List[int], windows: List[int],
+    ) -> int:
+        """
+        Detect repeating token patterns in generated sequence.
+
+        Scans multiple window sizes. For each window W, checks if the last
+        2*W tokens consist of the same W-length pattern repeated twice.
+
+        Returns:
+            Length of the repeating pattern (> 0 if repetition found), or 0.
+            Returns the LARGEST matching window for robust trimming.
+        """
+        n = len(tokens)
+        best = 0
+        for w in windows:
+            if n < 2 * w:
+                continue
+            # Compare tokens[-2w:-w] with tokens[-w:]
+            if tokens[n - 2 * w : n - w] == tokens[n - w :]:
+                best = w
+        return best
 
     @staticmethod
     def _split_thinking(text: str) -> tuple:
