@@ -48,11 +48,14 @@ HIGH_Z_TRIGGER = 1.5          # z-score threshold for "high" (was 1.0 hardcoded)
 CLARIFICATION_DIVERSITY_THRESHOLD = 0.6
 CLARIFICATION_CONFIDENCE_THRESHOLD = 0.3
 
-# Boundary event trigger: accumulated HEDGE/SEEK events in recent window
-# Catches cases where token-level entropy is low (e.g., LaTeX/math) but
-# the boundary guard keeps firing — model is at knowledge boundary.
-BOUNDARY_EVENT_WINDOW = 20
-BOUNDARY_EVENT_THRESHOLD = 6  # >= 6 boundary events in 20 steps
+# Boundary event trigger: cumulative HEDGE/SEEK count since session start
+# or last thinking trigger. Catches cases where token-level entropy is low
+# (e.g., LaTeX/math) but boundary guard keeps firing.
+# NOT a sliding window — cumulative count is immune to LaTeX token dilution.
+# With math-heavy output, HEDGE events cluster on Chinese reasoning tokens
+# and disappear during LaTeX blocks, making any fixed sliding window unreliable.
+BOUNDARY_CUMULATIVE_THRESHOLD = 8  # >= 8 total boundary events -> trigger
+BOUNDARY_MIN_STEPS = 40            # Don't trigger before this many steps
 
 # CoT injection cooldown: at least N steps between injections
 # Prevents repeated injection causing context explosion and latency blowup
@@ -93,9 +96,7 @@ class CoTManager:
         self._z_history: collections.deque = collections.deque(
             maxlen=HIGH_Z_WINDOW
         )
-        self._boundary_history: collections.deque = collections.deque(
-            maxlen=BOUNDARY_EVENT_WINDOW
-        )
+        self._boundary_events_since_think: int = 0
         self._consecutive_deep: int = 0
         self._steps_since_last_cot: int = cooldown_steps  # Allow first injection
         self._total_injections: int = 0
@@ -108,11 +109,11 @@ class CoTManager:
         """
         self._decision_history.append(signal.decision)
         self._z_history.append(signal.z_score)
-        # Track boundary events (HEDGE/SEEK = 1, GENERATE = 0)
-        is_boundary = signal.boundary_action not in (
+        # Track cumulative boundary events (HEDGE/SEEK)
+        if signal.boundary_action not in (
             BoundaryAction.GENERATE, BoundaryAction.REFUSE,
-        )
-        self._boundary_history.append(is_boundary)
+        ):
+            self._boundary_events_since_think += 1
         self._steps_since_last_cot += 1
 
         if signal.decision == Decision.DEEP:
@@ -150,14 +151,17 @@ class CoTManager:
             if high_z_count >= HIGH_Z_COUNT_THRESHOLD:
                 return True
 
-        # Path 3: boundary event accumulation
+        # Path 3: cumulative boundary events
         # Catches cases where individual token entropy is low but boundary
         # guard keeps firing (e.g., math/LaTeX tokens are syntactically
         # predictable but semantically at knowledge boundary).
-        if len(self._boundary_history) >= BOUNDARY_EVENT_WINDOW:
-            boundary_count = sum(self._boundary_history)
-            if boundary_count >= BOUNDARY_EVENT_THRESHOLD:
-                return True
+        # Uses cumulative count, NOT sliding window, because HEDGE events
+        # cluster on natural language tokens and vanish during LaTeX blocks.
+        if (
+            self._boundary_events_since_think >= BOUNDARY_CUMULATIVE_THRESHOLD
+            and self._steps_since_last_cot >= BOUNDARY_MIN_STEPS
+        ):
+            return True
 
         return False
 
@@ -193,13 +197,14 @@ class CoTManager:
         """Record a CoT injection"""
         self._total_injections += 1
         self._steps_since_last_cot = 0
+        self._boundary_events_since_think = 0  # Reset cumulative counter
         self._last_strategy = strategy
 
     def reset(self) -> None:
         """Reset session state (called at start of new session)"""
         self._decision_history.clear()
         self._z_history.clear()
-        self._boundary_history.clear()
+        self._boundary_events_since_think = 0
         self._consecutive_deep = 0
         self._steps_since_last_cot = self._cooldown_steps  # Allow first injection
         self._total_injections = 0

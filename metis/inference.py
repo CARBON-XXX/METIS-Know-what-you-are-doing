@@ -184,7 +184,7 @@ class MetisInference:
         last_rep_check_step = 0
         _REP_CHECK_INTERVAL = 20   # Check every N steps
         _REP_CHECK_START = 40      # Start checking after N tokens
-        _REP_WINDOWS = [12, 24, 48, 80]  # Window sizes to scan
+        _REP_WINDOWS = [10, 16, 24, 32, 40, 52, 64, 80]  # Window sizes to scan
         _REP_FORCE_STOP = 3        # Force stop after N repetition events
 
         # If thinking protocol enabled, write <thinking> tag to generated_tokens and notify callback
