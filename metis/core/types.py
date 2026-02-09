@@ -264,6 +264,24 @@ class SemanticCluster:
 
 
 @dataclass
+class LatencyProfile:
+    """
+    Latency breakdown for System 2 semantic entropy pipeline.
+    
+    Enables latency vs. accuracy trade-off analysis by tracking
+    time spent in each stage of the Kuhn et al. pipeline.
+    """
+    sampling_ms: float = 0.0            # Time for N forward-pass generations
+    entailment_ms: float = 0.0          # Time for NxN entailment / similarity checks
+    clustering_ms: float = 0.0          # Time for Union-Find clustering
+    total_ms: float = 0.0               # End-to-end pipeline time
+    n_samples_actual: int = 0           # Actual samples used (may be < N if early-exited)
+    n_entailment_calls: int = 0         # NLI/embedding calls made (reduced by hybrid pre-filter)
+    early_exit: bool = False            # Whether early-exit was triggered
+    method: str = ""                    # "nli", "embedding", or "hybrid"
+
+
+@dataclass
 class SemanticEntropyResult:
     """
     Kuhn et al. (ICLR 2023) generation-level semantic entropy result.
@@ -282,6 +300,7 @@ class SemanticEntropyResult:
     majority_answer: str = ""           # Representative answer from largest cluster
     majority_cluster_prob: float = 0.0  # Probability of largest cluster
     is_uncertain: bool = False          # SE > threshold -> genuinely uncertain
+    latency_profile: Optional[LatencyProfile] = None  # Pipeline latency breakdown
 
 
 @dataclass
