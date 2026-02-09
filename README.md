@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/METIS-v10.0-blue?style=for-the-badge" alt="Version">
   <img src="https://img.shields.io/badge/python-≥3.10-green?style=for-the-badge&logo=python" alt="Python">
   <img src="https://img.shields.io/badge/pytorch-≥2.0-red?style=for-the-badge&logo=pytorch" alt="PyTorch">
-  <img src="https://img.shields.io/badge/license-MIT-orange?style=for-the-badge" alt="License">
+  <img src="https://img.shields.io/badge/license-Apache_2.0-orange?style=for-the-badge" alt="License">
 </p>
 
 <h1 align="center">METIS</h1>
@@ -450,7 +450,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
+Apache-2.0 License — see [LICENSE](LICENSE) for details.
 
 ---
 
