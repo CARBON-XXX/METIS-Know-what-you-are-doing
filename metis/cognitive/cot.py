@@ -15,7 +15,7 @@ Strategy matrix:
 from typing import List, Optional
 import collections
 
-from ..core.types import CognitiveSignal, Decision, CoTStrategy
+from ..core.types import CognitiveSignal, Decision, CoTStrategy, BoundaryAction
 
 # =============================================================
 # Strategy selection thresholds
@@ -47,6 +47,12 @@ HIGH_Z_TRIGGER = 1.5          # z-score threshold for "high" (was 1.0 hardcoded)
 # High semantic diversity (diffuse probability distribution) + low confidence -> CLARIFICATION
 CLARIFICATION_DIVERSITY_THRESHOLD = 0.6
 CLARIFICATION_CONFIDENCE_THRESHOLD = 0.3
+
+# Boundary event trigger: accumulated HEDGE/SEEK events in recent window
+# Catches cases where token-level entropy is low (e.g., LaTeX/math) but
+# the boundary guard keeps firing — model is at knowledge boundary.
+BOUNDARY_EVENT_WINDOW = 20
+BOUNDARY_EVENT_THRESHOLD = 6  # >= 6 boundary events in 20 steps
 
 # CoT injection cooldown: at least N steps between injections
 # Prevents repeated injection causing context explosion and latency blowup
@@ -87,6 +93,9 @@ class CoTManager:
         self._z_history: collections.deque = collections.deque(
             maxlen=HIGH_Z_WINDOW
         )
+        self._boundary_history: collections.deque = collections.deque(
+            maxlen=BOUNDARY_EVENT_WINDOW
+        )
         self._consecutive_deep: int = 0
         self._steps_since_last_cot: int = cooldown_steps  # Allow first injection
         self._total_injections: int = 0
@@ -99,6 +108,11 @@ class CoTManager:
         """
         self._decision_history.append(signal.decision)
         self._z_history.append(signal.z_score)
+        # Track boundary events (HEDGE/SEEK = 1, GENERATE = 0)
+        is_boundary = signal.boundary_action not in (
+            BoundaryAction.GENERATE, BoundaryAction.REFUSE,
+        )
+        self._boundary_history.append(is_boundary)
         self._steps_since_last_cot += 1
 
         if signal.decision == Decision.DEEP:
@@ -108,14 +122,15 @@ class CoTManager:
 
     def should_inject(self) -> bool:
         """
-        Whether to inject CoT.
-        
-        Two trigger paths (OR):
-        1. Primary: consecutive DEEP >= 3
-        2. Fallback: >= 5 steps with z-score > 1.0 in last 12 steps
-           (addresses Bonferroni being too conservative causing few DEEP decisions)
-        
-        Both paths are constrained by cooldown and injection count limits.
+        Whether to trigger a <thinking> block.
+
+        Three trigger paths (OR):
+        1. Primary: consecutive DEEP >= 5 (sustained uncertainty)
+        2. z-score: >= 8 steps with z > 1.5 in last 12 (Bonferroni fallback)
+        3. Boundary: >= 6 HEDGE/SEEK events in last 20 steps
+           (catches low-entropy-but-stuck cases like math/LaTeX loops)
+
+        All paths constrained by cooldown and injection count limits.
         """
         # Hard cap
         if self._total_injections >= self._max_injections:
@@ -125,14 +140,23 @@ class CoTManager:
         if self._steps_since_last_cot < self._cooldown_steps:
             return False
 
-        # Primary path: consecutive DEEP
+        # Path 1: consecutive DEEP
         if self._consecutive_deep >= STANDARD_DEEP_STREAK:
             return True
 
-        # Fallback path: cumulative high z-score
+        # Path 2: cumulative high z-score
         if len(self._z_history) >= HIGH_Z_WINDOW:
             high_z_count = sum(1 for z in self._z_history if z > HIGH_Z_TRIGGER)
             if high_z_count >= HIGH_Z_COUNT_THRESHOLD:
+                return True
+
+        # Path 3: boundary event accumulation
+        # Catches cases where individual token entropy is low but boundary
+        # guard keeps firing (e.g., math/LaTeX tokens are syntactically
+        # predictable but semantically at knowledge boundary).
+        if len(self._boundary_history) >= BOUNDARY_EVENT_WINDOW:
+            boundary_count = sum(self._boundary_history)
+            if boundary_count >= BOUNDARY_EVENT_THRESHOLD:
                 return True
 
         return False
@@ -175,6 +199,7 @@ class CoTManager:
         """Reset session state (called at start of new session)"""
         self._decision_history.clear()
         self._z_history.clear()
+        self._boundary_history.clear()
         self._consecutive_deep = 0
         self._steps_since_last_cot = self._cooldown_steps  # Allow first injection
         self._total_injections = 0
