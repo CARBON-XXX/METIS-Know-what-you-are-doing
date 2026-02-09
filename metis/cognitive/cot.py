@@ -23,19 +23,27 @@ from ..core.types import CognitiveSignal, Decision, CoTStrategy
 # =============================================================
 
 # Oscillation detection: Decision switches exceeding threshold in last N steps -> REFLECTION
+# Raised from 4 to 6: Chinese text naturally alternates F/N/D on discourse tokens,
+# which is linguistic diversity, not epistemic oscillation.
 OSCILLATION_WINDOW = 8
-OSCILLATION_THRESHOLD = 4
+OSCILLATION_THRESHOLD = 6
 
 # Complexity detection: consecutive DEEP exceeding threshold -> DECOMPOSITION
 DECOMPOSITION_DEEP_STREAK = 5
 
 # Standard CoT trigger: consecutive DEEP exceeding threshold
-STANDARD_DEEP_STREAK = 3
+# Raised from 3 to 5: 3 consecutive DEEPs are common on CJK connective tokens
+# without genuine uncertainty. 5 consecutive DEEPs is a strong signal.
+STANDARD_DEEP_STREAK = 5
 
 # Fallback trigger: cumulative high z-score (backup path when DEEP decision is too conservative)
-# Count of z-score > 1.0 in last N steps exceeding threshold -> trigger
+# Count of z-score > Z_TRIGGER in last N steps exceeding threshold -> trigger
+# Raised count from 5 to 8 and z-threshold from 1.0 to 1.5:
+#   Chinese discourse markers (在/有很多/比如/等) routinely hit z=1.0-1.4
+#   without epistemic uncertainty. z>1.5 is a stronger signal of genuine confusion.
 HIGH_Z_WINDOW = 12
-HIGH_Z_COUNT_THRESHOLD = 5  # >= 5 high-z steps in 12
+HIGH_Z_COUNT_THRESHOLD = 8   # >= 8 high-z steps in 12 (was 5)
+HIGH_Z_TRIGGER = 1.5          # z-score threshold for "high" (was 1.0 hardcoded)
 
 # High semantic diversity (diffuse probability distribution) + low confidence -> CLARIFICATION
 CLARIFICATION_DIVERSITY_THRESHOLD = 0.6
@@ -43,7 +51,9 @@ CLARIFICATION_CONFIDENCE_THRESHOLD = 0.3
 
 # CoT injection cooldown: at least N steps between injections
 # Prevents repeated injection causing context explosion and latency blowup
-COT_COOLDOWN_STEPS = 15
+# Raised from 15 to 40: 15 Chinese tokens ≈ half a clause, far too short.
+# 40 tokens gives the model a full thought before re-evaluating.
+COT_COOLDOWN_STEPS = 40
 
 # Max CoT injections per session (hard cap to prevent excessive reasoning latency)
 MAX_COT_INJECTIONS_PER_SESSION = 3
@@ -189,7 +199,7 @@ class CoTManager:
 
         # Fallback path: cumulative high z-score
         if len(self._z_history) >= HIGH_Z_WINDOW:
-            high_z_count = sum(1 for z in self._z_history if z > 1.0)
+            high_z_count = sum(1 for z in self._z_history if z > HIGH_Z_TRIGGER)
             if high_z_count >= HIGH_Z_COUNT_THRESHOLD:
                 return True
 
