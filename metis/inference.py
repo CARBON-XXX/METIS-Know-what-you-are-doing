@@ -307,18 +307,18 @@ class MetisInference:
             # LaTeX/math tokens have low entropy even during loops, so
             # token-level signals alone cannot catch this.
             if step >= _REP_CHECK_START:
-                # Dense scan: check all possible window sizes up to N/2
-                # Limit max_window to 256 to allow catching paragraph-level loops
-                # while keeping performance reasonable.
-                max_window = min(len(generated_tokens) // 2, 256)
-                rep_len, match_score = self._detect_repetition_fuzzy(
-                    generated_tokens, max_window, threshold=0.75
+                # Jaccard scan: checks for bag-of-words similarity
+                # Catches "semantic loops" where model rephrases the same content
+                # e.g. "Let's construct X" vs "We try to construct X"
+                max_window = min(len(generated_tokens) // 2, 128)
+                rep_len, match_score = self._detect_repetition_jaccard(
+                    generated_tokens, max_window, threshold=0.6
                 )
                 if rep_len > 0:
                     repetition_events += 1
                     # Ensure log is visible
                     print(
-                        f"\n[METIS] DETECTED REPETITION len={rep_len} "
+                        f"\n[METIS] DETECTED REPETITION (Jaccard) len={rep_len} "
                         f"score={match_score:.2f} event={repetition_events}\n"
                     )
                     logger.warning(
@@ -600,39 +600,52 @@ class MetisInference:
         )
 
     @staticmethod
-    def _detect_repetition_fuzzy(
-        tokens: List[int], max_window: int, threshold: float = 0.75
+    def _detect_repetition_jaccard(
+        tokens: List[int], max_window: int, threshold: float = 0.5
     ) -> Tuple[int, float]:
         """
-        Detect repeating token patterns with fuzzy matching.
+        Detect repetition using Jaccard Similarity (Set-based).
+        Robust to insertion/deletion/reordering (semantic loops).
         
         Args:
             tokens: The token sequence
             max_window: Maximum pattern length to check
-            threshold: Minimum matching ratio (0.0-1.0) to consider a repeat
+            threshold: Jaccard similarity threshold (0.0-1.0)
             
         Returns:
-            (length, match_score): Length of repeat and the match score.
-            (0, 0.0) if no repetition found.
+            (length, jaccard_score)
         """
         n = len(tokens)
-        # Scan downwards from max_window to 3 to find longest match
-        # Lower limit 3 catches short loops like " a + b"
-        for w in range(max_window, 2, -1):
+        # Check a few strategic window sizes to cover different loop scales
+        # No need for dense scan; Jaccard is flexible.
+        windows = [16, 32, 64, 128]
+        
+        best_w = 0
+        best_score = 0.0
+        
+        for w in windows:
+            if w > max_window or n < 2 * w:
+                continue
+                
             # Window A (previous): tokens[n-2w : n-w]
             # Window B (current):  tokens[n-w : n]
+            set_a = set(tokens[n - 2 * w : n - w])
+            set_b = set(tokens[n - w : n])
             
-            # Count matches
-            matches = 0
-            for i in range(w):
-                if tokens[n - 2 * w + i] == tokens[n - w + i]:
-                    matches += 1
-            
-            score = matches / w
-            if score >= threshold:
-                return w, score
+            if not set_a or not set_b:
+                continue
                 
-        return 0, 0.0
+            intersection = len(set_a & set_b)
+            union = len(set_a | set_b)
+            jaccard = intersection / union
+            
+            if jaccard >= threshold:
+                # Prefer larger windows if scores are similar
+                if jaccard > best_score or (jaccard == best_score and w > best_w):
+                    best_score = jaccard
+                    best_w = w
+                    
+        return best_w, best_score
 
     @staticmethod
     def _split_thinking(text: str) -> tuple:
