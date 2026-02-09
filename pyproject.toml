@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metis-cognitive"
-version = "9.0.0"
+version = "10.0.0"
 description = "METIS — Metacognitive Entropy-driven Thinking & Introspection System. A cognitive layer for LLMs that provides real-time uncertainty monitoring, dual-system reasoning, and epistemic boundary detection."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -49,10 +49,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/METIS-Cognitive/METIS"
-Documentation = "https://github.com/METIS-Cognitive/METIS/tree/main/docs"
-Repository = "https://github.com/METIS-Cognitive/METIS"
-Issues = "https://github.com/METIS-Cognitive/METIS/issues"
+Homepage = "https://github.com/CARBON-XXX/METIS-Thinking-about-the-model"
+Documentation = "https://github.com/CARBON-XXX/METIS-Thinking-about-the-model/tree/main/docs"
+Repository = "https://github.com/CARBON-XXX/METIS-Thinking-about-the-model"
+Issues = "https://github.com/CARBON-XXX/METIS-Thinking-about-the-model/issues"
 
 [tool.setuptools.packages.find]
 include = ["metis*"]
