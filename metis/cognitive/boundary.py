@@ -35,9 +35,10 @@ UNCERTAIN_CONFIDENCE_GATE = 0.3 # UNCERTAIN zone: c > this means top token still
 # Semantic diversity gate: filters structurally-predictable tokens
 # In high-dimensional embedding space (~3584 dims), cosine similarity concentrates near 0,
 # so absolute diversity values are compressed into 0.5-1.0 range.
-# Gate at 0.75 filters punctuation/deterministic tokens (sd ~0.5-0.7) and
-# tokens where the dominant candidate pair has detectably higher similarity.
-SEMANTIC_DIVERSITY_GATE = 0.75
+# Observed sd range for content tokens: 0.60-0.97 (mean ~0.85).
+# Gate at 0.88 filters ~60% of content tokens (structural/synonym choices)
+# and only flags tokens with genuinely dispersed semantic candidates.
+SEMANTIC_DIVERSITY_GATE = 0.88
 
 
 class EpistemicBoundaryGuard:
@@ -126,7 +127,7 @@ class EpistemicBoundaryGuard:
             self._uncertainty_accumulator += z
             self._high_z_streak += 1
         else:
-            self._high_z_streak = max(0, self._high_z_streak - 1)
+            self._high_z_streak = 0
         
         # -- Clearly beyond cognitive boundary --
         # z > z_unk: entropy significantly anomalous
@@ -170,7 +171,7 @@ class EpistemicBoundaryGuard:
         # Even if individual tokens pass confidence gate (structural uncertainty),
         # long-term accumulated uncertainty still needs to be flagged
         avg_z = self._uncertainty_accumulator / max(self._token_count, 1)
-        if avg_z > AVG_Z_HEDGE_THRESHOLD or self._high_z_streak > STREAK_HEDGE_THRESHOLD:
+        if (avg_z > AVG_Z_HEDGE_THRESHOLD or self._high_z_streak > STREAK_HEDGE_THRESHOLD) and sd >= SEMANTIC_DIVERSITY_GATE:
             return self._emit(
                 EpistemicState.UNCERTAIN,
                 BoundaryAction.HEDGE,
