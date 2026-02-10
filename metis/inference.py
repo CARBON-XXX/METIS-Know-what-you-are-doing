@@ -191,6 +191,13 @@ class MetisInference:
         _REP_CHECK_START = 40      # Start after enough tokens for meaningful detection
         _REP_FORCE_STOP = 3        # Force stop after N repetition events
 
+        # Deferred CoT injection state: wait for sentence boundary
+        cot_pending = False
+        cot_pending_strategy: Optional[CoTStrategy] = None
+        cot_pending_since = -1
+        _COT_DEFER_MAX = 30  # Max tokens to wait for sentence boundary
+        _SENTENCE_BREAKS = frozenset('\u3002\uff01\uff1f\n.!?\uff1a:')
+
         # If thinking protocol enabled, write <thinking> tag to generated_tokens and notify callback
         if use_thinking_protocol:
             think_open = "<thinking>\n"
@@ -217,81 +224,97 @@ class MetisInference:
             signal = self._metis.step(logits)
             signals.append(signal)
 
-            # --- G3: Dynamic Thinking Trigger ---
-            # When sustained uncertainty is detected, open a <thinking> block
-            # and let the model reason freely. NO template injection —
-            # the model generates its own genuine reasoning.
+            # --- G3: Dynamic Thinking Trigger (deferred to sentence boundary) ---
+            # CUSUM detects sustained difficulty, but injection waits for a
+            # natural sentence break so the model enters thinking from a
+            # coherent context — not mid-sentence.
             self._cot_manager.observe(signal)
 
-            if self._cot_manager.should_inject() and not is_thinking:
-                strategy = self._cot_manager.select_strategy(signal)
-
-                # CRITICAL: Check for existing repetition before starting thinking.
-                # If model is already looping, we MUST trim the tail, otherwise
-                # the loop remains in context and contaminates the thinking block.
-                max_window = min(len(generated_tokens) // 2, 256)
-                rep_len, _ = self._detect_repetition_hybrid(
-                    generated_tokens, max_window
-                )
-                if rep_len > 0:
-                    logger.info(
-                        f"[METIS] Pre-CoT Repetition Trim: removed {rep_len} tokens"
-                    )
-                    generated_tokens = generated_tokens[:-rep_len]
-                    # Clear viz buffer to remove visual garbage
-                    vis_buffer.clear()
-
-                    # Regenerate KV cache to remove dirty context
-                    # If we don't do this, the deleted tokens remain in attention memory
-                    # and the model will likely loop again.
-                    if generated_tokens:
-                        gen_ids = torch.tensor([generated_tokens], device=model.device)
-                        full_input = torch.cat([prompt_ids, gen_ids], dim=1)
-                    else:
-                        full_input = prompt_ids
-
-                    with torch.no_grad():
-                        clean_out = model(
-                            input_ids=full_input,
-                            use_cache=True,
-                            return_dict=True,
-                        )
-                    past_key_values = clean_out.past_key_values
-                    logits = clean_out.logits[:, -1, :]
-
-                # Open <thinking> tag — model continues from here on its own
-                think_open = "\n<thinking>\n"
-                think_open_ids = tokenizer.encode(think_open, add_special_tokens=False)
-                for tid in think_open_ids:
-                    generated_tokens.append(tid)
-                if self._on_token is not None:
-                    open_signal = CognitiveSignal(
-                        decision=Decision.DEEP,
-                        introspection=f"[Thinking: {strategy.value}]",
-                    )
-                    self._on_token(think_open, open_signal)
-
-                # Feed <thinking> tag into model — it will generate real reasoning
-                open_input = torch.tensor([think_open_ids], device=model.device)
-                open_out = model(
-                    input_ids=open_input,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                past_key_values = open_out.past_key_values
-                logits = open_out.logits[:, -1, :]
-
-                is_thinking = True
-                thinking_start_step = step
-                self._cot_manager.record_injection(strategy)
-                cot_injected = True
-                cot_strategies_used.append(strategy)
-
+            if not cot_pending and self._cot_manager.should_inject() and not is_thinking:
+                cot_pending = True
+                cot_pending_strategy = self._cot_manager.select_strategy(signal)
+                cot_pending_since = step
                 logger.info(
-                    f"[METIS] Thinking triggered at step {step}: "
-                    f"reason={strategy.value}, z={signal.z_score:.2f}"
+                    f"[METIS] CoT CUSUM triggered at step {step}, "
+                    f"deferring to sentence boundary"
                 )
+
+            # Check if deferred CoT should fire now (sentence boundary or timeout)
+            if cot_pending and not is_thinking:
+                # Check last generated token for sentence-ending punctuation
+                last_char = ''
+                if generated_tokens:
+                    last_text = tokenizer.decode(generated_tokens[-1:], skip_special_tokens=True)
+                    last_char = last_text[-1] if last_text else ''
+                deferred_too_long = (step - cot_pending_since) >= _COT_DEFER_MAX
+
+                if last_char in _SENTENCE_BREAKS or deferred_too_long:
+                    strategy = cot_pending_strategy
+                    cot_pending = False
+                    cot_pending_strategy = None
+
+                    if deferred_too_long:
+                        logger.info(f"[METIS] CoT defer timeout at step {step}")
+
+                    # Check for existing repetition before starting thinking
+                    max_window = min(len(generated_tokens) // 2, 256)
+                    rep_len, _ = self._detect_repetition_hybrid(
+                        generated_tokens, max_window
+                    )
+                    if rep_len > 0:
+                        logger.info(
+                            f"[METIS] Pre-CoT Repetition Trim: removed {rep_len} tokens"
+                        )
+                        generated_tokens = generated_tokens[:-rep_len]
+                        vis_buffer.clear()
+
+                        if generated_tokens:
+                            gen_ids = torch.tensor([generated_tokens], device=model.device)
+                            full_input = torch.cat([prompt_ids, gen_ids], dim=1)
+                        else:
+                            full_input = prompt_ids
+
+                        with torch.no_grad():
+                            clean_out = model(
+                                input_ids=full_input,
+                                use_cache=True,
+                                return_dict=True,
+                            )
+                        past_key_values = clean_out.past_key_values
+                        logits = clean_out.logits[:, -1, :]
+
+                    # Open <thinking> tag at sentence boundary
+                    think_open = "\n<thinking>\n"
+                    think_open_ids = tokenizer.encode(think_open, add_special_tokens=False)
+                    for tid in think_open_ids:
+                        generated_tokens.append(tid)
+                    if self._on_token is not None:
+                        open_signal = CognitiveSignal(
+                            decision=Decision.DEEP,
+                            introspection=f"[Thinking: {strategy.value}]",
+                        )
+                        self._on_token(think_open, open_signal)
+
+                    open_input = torch.tensor([think_open_ids], device=model.device)
+                    open_out = model(
+                        input_ids=open_input,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    past_key_values = open_out.past_key_values
+                    logits = open_out.logits[:, -1, :]
+
+                    is_thinking = True
+                    thinking_start_step = step
+                    self._cot_manager.record_injection(strategy)
+                    cot_injected = True
+                    cot_strategies_used.append(strategy)
+
+                    logger.info(
+                        f"[METIS] Thinking injected at step {step}: "
+                        f"reason={strategy.value}, z={signal.z_score:.2f}"
+                    )
 
             # --- Boundary guard action execution ---
             if signal.boundary_action == BoundaryAction.REFUSE:
