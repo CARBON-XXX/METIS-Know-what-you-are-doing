@@ -31,9 +31,9 @@ OSCILLATION_THRESHOLD = 6
 DECOMPOSITION_DEEP_STREAK = 5
 
 # Standard CoT trigger: consecutive DEEP exceeding threshold
-# Raised from 3 to 5: 3 consecutive DEEPs are common on CJK connective tokens
-# without genuine uncertainty. 5 consecutive DEEPs is a strong signal.
-STANDARD_DEEP_STREAK = 5
+# Raised from 3 to 4: 3 consecutive DEEPs are common on CJK connective tokens
+# without genuine uncertainty. 4 consecutive DEEPs is a reliable signal.
+STANDARD_DEEP_STREAK = 4
 
 # Fallback trigger: cumulative high z-score (backup path when DEEP decision is too conservative)
 # Count of z-score > Z_TRIGGER in last N steps exceeding threshold -> trigger
@@ -56,6 +56,13 @@ CLARIFICATION_CONFIDENCE_THRESHOLD = 0.3
 # and disappear during LaTeX blocks, making any fixed sliding window unreliable.
 BOUNDARY_CUMULATIVE_THRESHOLD = 8  # >= 8 total boundary events -> trigger
 BOUNDARY_MIN_STEPS = 40            # Don't trigger before this many steps
+
+# DEEP ratio trigger: catches dispersed DEEP signals that consecutive-streak misses.
+# IMO/competition math produces many DEEP decisions scattered among NORMAL/FAST tokens
+# (LaTeX, punctuation, simple connectives break the streak but uncertainty persists).
+# 35% DEEP in 20 tokens = strong signal of sustained difficulty.
+DEEP_RATIO_WINDOW = 20
+DEEP_RATIO_THRESHOLD = 0.35
 
 # CoT injection cooldown: at least N steps between injections
 # Prevents repeated injection causing context explosion and latency blowup
@@ -91,7 +98,7 @@ class CoTManager:
 
         # Session state
         self._decision_history: collections.deque = collections.deque(
-            maxlen=OSCILLATION_WINDOW
+            maxlen=DEEP_RATIO_WINDOW
         )
         self._z_history: collections.deque = collections.deque(
             maxlen=HIGH_Z_WINDOW
@@ -125,11 +132,11 @@ class CoTManager:
         """
         Whether to trigger a <thinking> block.
 
-        Three trigger paths (OR):
-        1. Primary: consecutive DEEP >= 5 (sustained uncertainty)
+        Four trigger paths (OR):
+        1. Primary: consecutive DEEP >= 4 (sustained uncertainty)
         2. z-score: >= 8 steps with z > 1.5 in last 12 (Bonferroni fallback)
-        3. Boundary: >= 6 HEDGE/SEEK events in last 20 steps
-           (catches low-entropy-but-stuck cases like math/LaTeX loops)
+        3. Boundary: >= 8 cumulative HEDGE/SEEK events
+        4. DEEP ratio: >= 35% DEEP in last 20 tokens (dispersed uncertainty)
 
         All paths constrained by cooldown and injection count limits.
         """
@@ -162,6 +169,17 @@ class CoTManager:
             and self._steps_since_last_cot >= BOUNDARY_MIN_STEPS
         ):
             return True
+
+        # Path 4: DEEP ratio in sliding window
+        # Catches dispersed DEEP signals that consecutive-streak misses.
+        # Competition math / hard reasoning produces many DEEPs scattered
+        # among LaTeX tokens and simple connectives.
+        if len(self._decision_history) >= DEEP_RATIO_WINDOW:
+            deep_count = sum(
+                1 for d in self._decision_history if d == Decision.DEEP
+            )
+            if deep_count / DEEP_RATIO_WINDOW >= DEEP_RATIO_THRESHOLD:
+                return True
 
         return False
 
@@ -221,9 +239,12 @@ class CoTManager:
         if len(self._decision_history) < OSCILLATION_WINDOW:
             return False
 
+        # Only look at the last OSCILLATION_WINDOW elements
+        # (decision_history may be wider for DEEP ratio tracking)
+        recent = list(self._decision_history)[-OSCILLATION_WINDOW:]
         switches = 0
         prev = None
-        for d in self._decision_history:
+        for d in recent:
             if prev is not None and d != prev:
                 switches += 1
             prev = d

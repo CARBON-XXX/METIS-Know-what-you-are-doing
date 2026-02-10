@@ -31,6 +31,8 @@ STREAK_HEDGE_THRESHOLD = 5      # consecutive high z > 5 -> HEDGE
 MIN_STREAK_FOR_REFUSE = 5       # REFUSE/SEEK requires >= 5 consecutive high-z tokens
                                 # 3-4 token streaks are common at reasoning transitions in math/logic
 UNCERTAIN_CONFIDENCE_GATE = 0.3 # UNCERTAIN zone: c > this means top token still dominant -> no HEDGE
+UNCERTAIN_STREAK_THRESHOLD = 7  # Uncertain zone needs longer streak than unknown zone
+                                # Math reasoning routinely produces 5-6 consecutive z > z_unc tokens
 
 # Semantic diversity gate: filters structurally-predictable tokens
 # In high-dimensional embedding space (~3584 dims), cosine similarity concentrates near 0,
@@ -186,7 +188,7 @@ class EpistemicBoundaryGuard:
             if sd < SEMANTIC_DIVERSITY_GATE:
                 # Low diversity: synonym choices, not real uncertainty
                 return self._emit(EpistemicState.LIKELY, BoundaryAction.GENERATE, "")
-            if self._high_z_streak >= MIN_STREAK_FOR_REFUSE:
+            if self._high_z_streak >= UNCERTAIN_STREAK_THRESHOLD:
                 if c < UNCERTAIN_CONFIDENCE_GATE:
                     return self._emit(
                         EpistemicState.UNCERTAIN,
