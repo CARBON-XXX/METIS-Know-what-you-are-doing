@@ -407,8 +407,8 @@ class MetisInference:
                         generated_tokens = generated_tokens[:-rep_len]
                         break
 
-                    elif not is_thinking:
-                        # Escalation 1: Trigger thinking IMMEDIATELY
+                    elif not is_thinking and use_thinking_protocol:
+                        # Escalation 1: Trigger thinking (think=ON only)
                         # If model repeats itself, it's stuck. Stop and think.
                         logger.info(
                             "[METIS] Repetition -> triggering thinking "
@@ -463,6 +463,34 @@ class MetisInference:
                         is_thinking = True
                         thinking_start_step = step
                         cot_injected = True
+
+                    elif not is_thinking:
+                        # think=OFF: trim repeated tail + rebuild KV cache
+                        # Don't inject thinking — just give model fresh context
+                        logger.info(
+                            f"[METIS] Repetition (think=OFF) -> "
+                            f"trim {rep_len} tokens + rebuild KV"
+                        )
+                        generated_tokens = generated_tokens[:-rep_len]
+                        vis_buffer.clear()
+
+                        if generated_tokens:
+                            gen_ids = torch.tensor(
+                                [generated_tokens], device=model.device
+                            )
+                            full_input = torch.cat(
+                                [prompt_ids, gen_ids], dim=1
+                            )
+                        else:
+                            full_input = prompt_ids
+                        with torch.no_grad():
+                            clean_out = model(
+                                input_ids=full_input,
+                                use_cache=True,
+                                return_dict=True,
+                            )
+                        past_key_values = clean_out.past_key_values
+                        logits = clean_out.logits[:, -1, :]
 
                     else:
                         # Escalation 2: Repetition INSIDE thinking block.
