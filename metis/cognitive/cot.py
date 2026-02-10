@@ -2,11 +2,18 @@
 METIS CoT Manager
 Dynamic Chain-of-Thought strategy manager
 
-Selects the most appropriate CoT injection strategy based on cognitive signal characteristics.
-Instead of uniformly saying "let me think", it precisely guides the model
-into different reasoning modes based on the source of uncertainty.
+Uses a CUSUM (Cumulative Sum) control chart on cognitive difficulty
+to detect when the model needs to "stop and think".
 
-Strategy matrix:
+The difficulty score integrates z-score, DEEP decision, and semantic diversity
+into a single signal. CUSUM accumulates this signal over time, triggering
+a <thinking> block when sustained difficulty is detected.
+
+This replaces four crude counting heuristics (consecutive DEEP, high-z count,
+boundary event count, DEEP ratio) with a single principled statistic that
+naturally captures both duration and magnitude of cognitive difficulty.
+
+Strategy matrix (for diagnostic classification after trigger):
   - STANDARD:      Generic high entropy → "Let me think carefully"
   - CLARIFICATION:  Conceptual ambiguity → "Let me verify the definitions"
   - DECOMPOSITION:  Logical complexity → "Let me break it down step by step"
@@ -18,74 +25,61 @@ import collections
 from ..core.types import CognitiveSignal, Decision, CoTStrategy, BoundaryAction
 
 # =============================================================
-# Strategy selection thresholds
+# CUSUM parameters for cognitive difficulty detection
+# =============================================================
+#
+# Formula: S(t) = max(0, S(t-1) + difficulty(t) - k)
+#   difficulty(t) = (max(0, z) + deep_bonus) * sd
+#
+# Lower k and h than boundary guard → CoT triggers BEFORE HEDGE,
+# giving the model a chance to reason through difficulty.
+
+COT_CUSUM_K = 0.3           # Allowance (lower than boundary = more sensitive)
+COT_CUSUM_H = 4.0           # Trigger threshold
+COT_CUSUM_DECAY = 0.9       # Decay when z < 0 (slower than boundary)
+COT_DEEP_BONUS = 0.3        # Bonus contribution for DEEP decisions
+
+# =============================================================
+# Strategy selection thresholds (diagnostic, NOT trigger-related)
 # =============================================================
 
-# Oscillation detection: Decision switches exceeding threshold in last N steps -> REFLECTION
-# Raised from 4 to 6: Chinese text naturally alternates F/N/D on discourse tokens,
-# which is linguistic diversity, not epistemic oscillation.
+# Oscillation detection: Decision switches in recent window -> REFLECTION
 OSCILLATION_WINDOW = 8
 OSCILLATION_THRESHOLD = 6
 
-# Complexity detection: consecutive DEEP exceeding threshold -> DECOMPOSITION
+# Complexity detection: consecutive DEEP -> DECOMPOSITION strategy
 DECOMPOSITION_DEEP_STREAK = 5
 
-# Standard CoT trigger: consecutive DEEP exceeding threshold
-# Raised from 3 to 4: 3 consecutive DEEPs are common on CJK connective tokens
-# without genuine uncertainty. 4 consecutive DEEPs is a reliable signal.
-STANDARD_DEEP_STREAK = 4
-
-# Fallback trigger: cumulative high z-score (backup path when DEEP decision is too conservative)
-# Count of z-score > Z_TRIGGER in last N steps exceeding threshold -> trigger
-# Raised count from 5 to 8 and z-threshold from 1.0 to 1.5:
-#   Chinese discourse markers (在/有很多/比如/等) routinely hit z=1.0-1.4
-#   without epistemic uncertainty. z>1.5 is a stronger signal of genuine confusion.
-HIGH_Z_WINDOW = 12
-HIGH_Z_COUNT_THRESHOLD = 8   # >= 8 high-z steps in 12 (was 5)
-HIGH_Z_TRIGGER = 1.5          # z-score threshold for "high" (was 1.0 hardcoded)
-
-# High semantic diversity (diffuse probability distribution) + low confidence -> CLARIFICATION
+# Conceptual ambiguity: high semantic diversity + low confidence -> CLARIFICATION
 CLARIFICATION_DIVERSITY_THRESHOLD = 0.6
 CLARIFICATION_CONFIDENCE_THRESHOLD = 0.3
 
-# Boundary event trigger: cumulative HEDGE/SEEK count since session start
-# or last thinking trigger. Catches cases where token-level entropy is low
-# (e.g., LaTeX/math) but boundary guard keeps firing.
-# NOT a sliding window — cumulative count is immune to LaTeX token dilution.
-# With math-heavy output, HEDGE events cluster on Chinese reasoning tokens
-# and disappear during LaTeX blocks, making any fixed sliding window unreliable.
-BOUNDARY_CUMULATIVE_THRESHOLD = 8  # >= 8 total boundary events -> trigger
-BOUNDARY_MIN_STEPS = 40            # Don't trigger before this many steps
-
-# DEEP ratio trigger: catches dispersed DEEP signals that consecutive-streak misses.
-# IMO/competition math produces many DEEP decisions scattered among NORMAL/FAST tokens
-# (LaTeX, punctuation, simple connectives break the streak but uncertainty persists).
-# 35% DEEP in 20 tokens = strong signal of sustained difficulty.
-DEEP_RATIO_WINDOW = 20
-DEEP_RATIO_THRESHOLD = 0.35
+# =============================================================
+# Injection limits
+# =============================================================
 
 # CoT injection cooldown: at least N steps between injections
-# Prevents repeated injection causing context explosion and latency blowup
-# Raised from 15 to 40: 15 Chinese tokens ≈ half a clause, far too short.
-# 40 tokens gives the model a full thought before re-evaluating.
 COT_COOLDOWN_STEPS = 40
 
-# Max CoT injections per session (hard cap to prevent excessive reasoning latency)
+# Max CoT injections per session (hard cap)
 MAX_COT_INJECTIONS_PER_SESSION = 3
 
 
 class CoTManager:
     """
-    Dynamic Chain-of-Thought trigger manager.
+    Dynamic Chain-of-Thought trigger manager — CUSUM-based.
 
-    Template-free design: CoTManager only decides WHEN and WHY to trigger
-    thinking, NOT what to think. The actual reasoning is generated freely
-    by the model inside a <thinking> block.
+    Uses a cognitive difficulty CUSUM to detect when the model needs to
+    "stop and think". This replaces four crude counting heuristics with
+    a single principled statistic.
 
-    Responsibilities:
-    1. Determine whether to open a <thinking> block based on cognitive signals
-    2. Classify the trigger reason (strategy) for logging/analysis
-    3. Manage injection cooldown to prevent excessive thinking blocks
+    The difficulty CUSUM:
+      S(t) = max(0, S(t-1) + (z_contrib + deep_bonus) * sd - k)
+    accumulates sd-weighted cognitive difficulty over time. When it
+    exceeds the threshold, a <thinking> block is injected.
+
+    Template-free: CoTManager decides WHEN and WHY to think.
+    The model generates its own reasoning inside the <thinking> block.
     """
 
     def __init__(
@@ -96,15 +90,16 @@ class CoTManager:
         self._cooldown_steps = cooldown_steps
         self._max_injections = max_injections
 
-        # Session state
+        # CUSUM state
+        self._difficulty_cusum: float = 0.0
+
+        # Strategy selection state (kept for diagnostic classification)
         self._decision_history: collections.deque = collections.deque(
-            maxlen=DEEP_RATIO_WINDOW
+            maxlen=OSCILLATION_WINDOW
         )
-        self._z_history: collections.deque = collections.deque(
-            maxlen=HIGH_Z_WINDOW
-        )
-        self._boundary_events_since_think: int = 0
         self._consecutive_deep: int = 0
+
+        # Injection tracking
         self._steps_since_last_cot: int = cooldown_steps  # Allow first injection
         self._total_injections: int = 0
         self._last_strategy: CoTStrategy = CoTStrategy.NONE
@@ -114,74 +109,42 @@ class CoTManager:
         Called each step to update internal state.
         Must be called before should_inject / select_strategy.
         """
+        # Strategy selection tracking
         self._decision_history.append(signal.decision)
-        self._z_history.append(signal.z_score)
-        # Track cumulative boundary events (HEDGE/SEEK)
-        if signal.boundary_action not in (
-            BoundaryAction.GENERATE, BoundaryAction.REFUSE,
-        ):
-            self._boundary_events_since_think += 1
-        self._steps_since_last_cot += 1
-
         if signal.decision == Decision.DEEP:
             self._consecutive_deep += 1
         else:
             self._consecutive_deep = 0
+        self._steps_since_last_cot += 1
+
+        # ── Difficulty CUSUM update ──
+        z = signal.z_score
+        sd = signal.semantic_diversity
+        deep_bonus = COT_DEEP_BONUS if signal.decision == Decision.DEEP else 0.0
+
+        if z > 0 or deep_bonus > 0:
+            # Positive z or DEEP decision contributes to difficulty
+            z_contrib = max(0.0, z)
+            increment = (z_contrib + deep_bonus) * sd - COT_CUSUM_K
+            self._difficulty_cusum = max(0.0, self._difficulty_cusum + increment)
+        elif z < 0:
+            # Confident token: decay accumulated difficulty
+            self._difficulty_cusum *= COT_CUSUM_DECAY
 
     def should_inject(self) -> bool:
         """
         Whether to trigger a <thinking> block.
 
-        Four trigger paths (OR):
-        1. Primary: consecutive DEEP >= 4 (sustained uncertainty)
-        2. z-score: >= 8 steps with z > 1.5 in last 12 (Bonferroni fallback)
-        3. Boundary: >= 8 cumulative HEDGE/SEEK events
-        4. DEEP ratio: >= 35% DEEP in last 20 tokens (dispersed uncertainty)
-
-        All paths constrained by cooldown and injection count limits.
+        Single trigger: difficulty CUSUM >= threshold.
+        Constrained by cooldown and injection count limits.
         """
-        # Hard cap
         if self._total_injections >= self._max_injections:
             return False
 
-        # Cooldown
         if self._steps_since_last_cot < self._cooldown_steps:
             return False
 
-        # Path 1: consecutive DEEP
-        if self._consecutive_deep >= STANDARD_DEEP_STREAK:
-            return True
-
-        # Path 2: cumulative high z-score
-        if len(self._z_history) >= HIGH_Z_WINDOW:
-            high_z_count = sum(1 for z in self._z_history if z > HIGH_Z_TRIGGER)
-            if high_z_count >= HIGH_Z_COUNT_THRESHOLD:
-                return True
-
-        # Path 3: cumulative boundary events
-        # Catches cases where individual token entropy is low but boundary
-        # guard keeps firing (e.g., math/LaTeX tokens are syntactically
-        # predictable but semantically at knowledge boundary).
-        # Uses cumulative count, NOT sliding window, because HEDGE events
-        # cluster on natural language tokens and vanish during LaTeX blocks.
-        if (
-            self._boundary_events_since_think >= BOUNDARY_CUMULATIVE_THRESHOLD
-            and self._steps_since_last_cot >= BOUNDARY_MIN_STEPS
-        ):
-            return True
-
-        # Path 4: DEEP ratio in sliding window
-        # Catches dispersed DEEP signals that consecutive-streak misses.
-        # Competition math / hard reasoning produces many DEEPs scattered
-        # among LaTeX tokens and simple connectives.
-        if len(self._decision_history) >= DEEP_RATIO_WINDOW:
-            deep_count = sum(
-                1 for d in self._decision_history if d == Decision.DEEP
-            )
-            if deep_count / DEEP_RATIO_WINDOW >= DEEP_RATIO_THRESHOLD:
-                return True
-
-        return False
+        return self._difficulty_cusum >= COT_CUSUM_H
 
     def select_strategy(self, signal: CognitiveSignal) -> CoTStrategy:
         """
@@ -212,18 +175,17 @@ class CoTManager:
         return CoTStrategy.STANDARD
 
     def record_injection(self, strategy: CoTStrategy) -> None:
-        """Record a CoT injection"""
+        """Record a CoT injection and reset CUSUM"""
         self._total_injections += 1
         self._steps_since_last_cot = 0
-        self._boundary_events_since_think = 0  # Reset cumulative counter
+        self._difficulty_cusum = 0.0  # Reset CUSUM after injection
         self._last_strategy = strategy
 
     def reset(self) -> None:
         """Reset session state (called at start of new session)"""
         self._decision_history.clear()
-        self._z_history.clear()
-        self._boundary_events_since_think = 0
         self._consecutive_deep = 0
+        self._difficulty_cusum = 0.0
         self._steps_since_last_cot = self._cooldown_steps  # Allow first injection
         self._total_injections = 0
         self._last_strategy = CoTStrategy.NONE
@@ -239,12 +201,9 @@ class CoTManager:
         if len(self._decision_history) < OSCILLATION_WINDOW:
             return False
 
-        # Only look at the last OSCILLATION_WINDOW elements
-        # (decision_history may be wider for DEEP ratio tracking)
-        recent = list(self._decision_history)[-OSCILLATION_WINDOW:]
         switches = 0
         prev = None
-        for d in recent:
+        for d in self._decision_history:
             if prev is not None and d != prev:
                 switches += 1
             prev = d
@@ -255,6 +214,7 @@ class CoTManager:
     def stats(self) -> dict:
         return {
             "total_injections": self._total_injections,
+            "difficulty_cusum": round(self._difficulty_cusum, 2),
             "consecutive_deep": self._consecutive_deep,
             "steps_since_last_cot": self._steps_since_last_cot,
             "last_strategy": self._last_strategy.value,
