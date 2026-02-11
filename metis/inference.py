@@ -581,7 +581,7 @@ class MetisInference:
 
             # --- Token sampling (cognitive-aware) ---
             next_token_id = self._cognitive_sample(
-                logits, signal, temperature, top_p
+                logits, signal, temperature, top_p, generated_tokens
             )
             
             # --- Max Thinking Tokens: force-close thinking block ---
@@ -636,7 +636,7 @@ class MetisInference:
 
                     # Re-sample from post-closing logits for the answer
                     next_token_id = self._cognitive_sample(
-                        logits, signal, temperature, top_p
+                        logits, signal, temperature, top_p, generated_tokens
                     )
                     # Skip Anti-Lazy check since we just closed
                     generated_tokens.append(next_token_id)
@@ -711,7 +711,7 @@ class MetisInference:
                             logits[0, close_tag_ids[0]] = float('-inf')
 
                         next_token_id = self._cognitive_sample(
-                            logits, signal, temperature, top_p
+                            logits, signal, temperature, top_p, generated_tokens
                         )
 
                         logger.info(
@@ -992,12 +992,17 @@ class MetisInference:
 
         return answer, thinking_text
 
+    # Repetition penalty constants
+    _REP_PENALTY = 1.3         # Penalty factor (1.0 = none, >1.0 = penalize)
+    _REP_PENALTY_WINDOW = 128  # Only penalize tokens in last N generated
+
     def _cognitive_sample(
         self,
         logits: torch.Tensor,
         signal: CognitiveSignal,
         base_temperature: float,
         base_top_p: float,
+        generated_tokens: Optional[List[int]] = None,
     ) -> int:
         """
         Cognitive-aware sampling — METIS core intervention point.
@@ -1007,10 +1012,9 @@ class MetisInference:
         - NORMAL: user settings → standard sampling
         - DEEP (System 2): raise temp + expand top_p → increase exploration
 
-        Also applies entropy-aware logit modulation:
-        - High confidence (low z): no extra processing
-        - Low confidence (high z + low conf): sharpen distribution, suppress long-tail noise
-          (similar to contrastive decoding, Li et al. 2022)
+        Also applies:
+        - Entropy-aware logit modulation (contrastive-decoding-like sharpening)
+        - Repetition penalty on recently generated tokens
         """
         # -- 1. Decision-driven adaptive temperature --
         # METIS autonomously controls sampling strategy.
@@ -1032,7 +1036,25 @@ class MetisInference:
             temperature = base_temperature
             top_p = base_top_p
 
-        # -- 2. Entropy-aware logit modulation --
+        # -- 2. Repetition penalty --
+        # Penalize recently generated tokens to prevent loops.
+        # Standard approach: logit > 0 → divide by penalty, logit < 0 → multiply.
+        # This pushes repeated tokens down without distorting the distribution shape.
+        if generated_tokens:
+            recent = generated_tokens[-self._REP_PENALTY_WINDOW:]
+            unique_tokens = set(recent)
+            if unique_tokens:
+                token_ids = torch.tensor(list(unique_tokens), device=logits.device)
+                scores = logits[..., token_ids]
+                # Apply penalty: positive logits shrink, negative logits grow more negative
+                scores = torch.where(
+                    scores > 0,
+                    scores / self._REP_PENALTY,
+                    scores * self._REP_PENALTY,
+                )
+                logits[..., token_ids] = scores
+
+        # -- 3. Entropy-aware logit modulation --
         # When z-score high + confidence low: flat distribution, likely to sample unreliable tokens
         # Adaptive sharpening reduces random walk
         # SKIP at temperature=0: greedy decoding should be deterministic.
@@ -1041,7 +1063,7 @@ class MetisInference:
             sharpness = 1.0 + 0.15 * min(signal.z_score - 1.0, 3.0)
             logits = logits * sharpness
 
-        # -- 3. Sampling --
+        # -- 4. Sampling --
         if temperature <= 0:
             return logits.argmax(dim=-1).item()
 
