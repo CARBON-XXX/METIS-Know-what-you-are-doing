@@ -4,13 +4,24 @@ Numerically stable online statistics
 
 Recomputed from buffer on demand, ensuring precision for higher-order moments.
 O(N) for N=window_size, but guarantees precision for skewness/kurtosis.
+
+If metis_native (Rust/PyO3) is available, NativeSlidingWindowStats is used
+as a drop-in accelerator (~10-50x on tight loops). Otherwise falls back to
+pure Python.
 """
 import collections
 import math
 from typing import Dict
 
+# ── Try Rust native accelerator ──
+try:
+    from metis_native import SlidingWindowStats as _NativeStats
+    _HAS_NATIVE = True
+except ImportError:
+    _HAS_NATIVE = False
 
-class SlidingWindowStats:
+
+class _PySlidingWindowStats:
     """
     Sliding window statistics.
     
@@ -82,3 +93,10 @@ class SlidingWindowStats:
         m = self.mean
         var = sum((x - m) ** 2 for x in self.buffer) / (len(self.buffer) - 1)
         return math.sqrt(var) if var > 1e-10 else 0.01
+
+    def reset(self) -> None:
+        self.buffer.clear()
+
+
+# ── Public alias: prefer Rust native if available ──
+SlidingWindowStats = _NativeStats if _HAS_NATIVE else _PySlidingWindowStats

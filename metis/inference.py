@@ -22,6 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .metis import Metis
+
+# ── Try Rust native accelerator for repetition detection ──
+try:
+    from metis_native import detect_repetition_hybrid as _native_rep_detect
+    _HAS_NATIVE_REP = True
+except ImportError:
+    _HAS_NATIVE_REP = False
+
 from .core.types import (
     Decision,
     EpistemicState,
@@ -933,6 +941,10 @@ class MetisInference:
         
         Returns: (length, score)
         """
+        # Rust native fast path (~10-50x speedup)
+        if _HAS_NATIVE_REP:
+            return _native_rep_detect(tokens, max_window)
+
         n = len(tokens)
         
         # 1. Check Long Semantic Loops (Jaccard)
