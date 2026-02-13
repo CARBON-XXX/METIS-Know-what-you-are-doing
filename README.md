@@ -302,13 +302,45 @@ Thresholds:
 - **Single statistic replaces 5+ hardcoded thresholds** — cleaner, more maintainable
 - **Gradual decay, not hard reset** — tolerates brief confident interjections within an uncertain region
 
+**Surprise feedback loop:** After each token is sampled, its surprise (-log₂ p) is fed back to the boundary guard with a 1-step lag. When surprise exceeds 3.0 bits (model generated something it doesn't believe in), the CUSUM receives an independent boost proportional to the excess surprise. This catches hallucination patterns where the model appears confident (low z-score) but actually outputs unlikely tokens.
+
 **Epistemic state** (KNOWN/LIKELY/UNCERTAIN/UNKNOWN) is classified by the current z-score for diagnostic reporting. **Boundary actions** are driven by the CUSUM level.
 
 **REFUSE uses a grace period:**
 - Early tokens (within first 8): REFUSE triggers immediately
 - After the model has committed to an answer: requires consecutive REFUSE signals
 
-### 5. Hallucination Self-Correction (G4)
+### 5. Cognitive Phase Detection
+
+METIS classifies the generation into **five cognitive phases** based on windowed signal statistics (self-calibrating from the session's own distribution):
+
+| Phase | Condition | Meaning |
+|:---|:---|:---|
+| **FLUENT** | Very low H, very high conf, mostly FAST | Autopilot: generating well-known patterns |
+| **RECALL** | Low H, above-average conf | Knowledge retrieval: recalling stored facts |
+| **REASONING** | Moderate H, DEEP decisions present | Active computation: working through a problem |
+| **EXPLORATION** | High H, high diversity | Searching: exploring alternative answers |
+| **CONFUSION** | High H, low diversity, rising momentum | Stuck: unable to find a good path |
+
+Phases are detected using a sliding window of 8 tokens. All thresholds are z-scores relative to the session's running entropy mean/std — no hardcoded floors.
+
+### 6. Predictive Cognitive Signals
+
+METIS tracks three predictive signals that go beyond reactive entropy measurement:
+
+| Signal | Formula | Use |
+|:---|:---|:---|
+| **Token Surprise** | -log₂ p(sampled_token) | Prediction error — model generated something it doesn't believe |
+| **Entropy Gradient** | H(t) - H(t-1) | Rate of entropy change (1st derivative) |
+| **Entropy Momentum** | EMA of gradient (α=0.1) | Entropy acceleration — predicts imminent difficulty spikes |
+
+These feed into:
+- **Predictive CoT trigger**: momentum early-warning fires before CUSUM reaches threshold
+- **Adaptive repetition penalty**: scales 1.2–1.5× based on z-score + momentum
+- **Surprise-weighted boundary CUSUM**: accelerates hallucination detection
+- **3-signal hallucination risk**: contradiction + surprise + SE in MetacognitiveCore
+
+### 7. Hallucination Self-Correction (G4)
 
 When MetacognitiveCore detects `hallucination_risk > 0.3`:
 
@@ -317,7 +349,7 @@ When MetacognitiveCore detects `hallucination_risk > 0.3`:
 3. **Adopt**: Use the higher-confidence version (with a 10% relative improvement threshold)
 4. **Budget**: Correction generation is capped at `min(max_correction_tokens, max_tokens)` to prevent runaway cost
 
-### 6. Curiosity Driver
+### 8. Curiosity Driver
 
 Records **knowledge gaps** for autonomous self-improvement:
 
@@ -332,7 +364,7 @@ Future Use:
   Dreaming Phase → targeted fine-tuning on recorded gaps
 ```
 
-### 7. MetacognitiveCore — Introspection
+### 9. MetacognitiveCore — Introspection
 
 After generation, MetacognitiveCore analyzes the full cognitive trace and produces a `MetaJudgment`:
 

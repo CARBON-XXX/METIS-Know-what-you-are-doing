@@ -222,9 +222,20 @@ class CognitiveVisualizer:
         else:
             mom_arrow = f"{C.GRAY}\u2192{C.RESET}"
 
+        # Cognitive phase label
+        _phase_map = {
+            "fluent": (C.GREEN, "FLU"),
+            "recall": (C.CYAN, "RCL"),
+            "reasoning": (C.YELLOW, "RSN"),
+            "exploration": (C.MAGENTA, "EXP"),
+            "confusion": (C.RED, "CON"),
+        }
+        _pc, _pl = _phase_map.get(signal.cognitive_phase, (C.GRAY, "???"))
+
         sys.stdout.write(
             f"  {C.GRAY}[{self.token_count:3d}]{C.RESET} "
             f"{dc}{C.BOLD}{di}{C.RESET} "
+            f"{_pc}{_pl}{C.RESET} "
             f"{C.CYAN}H={signal.semantic_entropy:.2f}{C.RESET} "
             f"z={signal.z_score:+.2f} "
             f"{sd_color}sd={sd:.2f}{C.RESET} "
