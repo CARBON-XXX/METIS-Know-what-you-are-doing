@@ -175,6 +175,14 @@ class MetacognitiveCore:
         trace.mean_entropy = sum(e.semantic_entropy for e in events) / n
         trace.mean_confidence = sum(e.confidence for e in events) / n
 
+        # Surprise statistics
+        surprises = [e.token_surprise for e in events]
+        trace.mean_surprise = sum(surprises) / n
+        trace.peak_surprise = max(surprises)
+        # "High surprise" = tokens where the model surprised itself (> 2× mean)
+        surprise_floor = max(trace.mean_surprise * 2.0, 3.0)  # at least 3 bits
+        trace.high_surprise_count = sum(1 for s in surprises if s > surprise_floor)
+
         # Overall trend: compare second half vs first half mean entropy
         # Adaptive: use session's own entropy std as the significance threshold
         # instead of hardcoded 0.3 — different models/tasks have different baselines
@@ -265,11 +273,12 @@ class MetacognitiveCore:
         """
         Hallucination risk [0, 1].
 
-        Core signal: contradiction detection
-        - High confidence + high z-score = model confident but answer unstable -> hallucination
+        Three signal sources (all self-calibrating from session data):
+        1. Contradiction detection: high confidence + high z-score
+        2. Token surprise: model generating tokens it doesn't believe
+        3. Kuhn et al. SE (if available): generation-level semantic disagreement
 
-        Self-calibrating: "high confidence" and "high z-score" are defined
-        relative to the SESSION's own distributions (mean + 1 std),
+        "High" is defined relative to the SESSION's own distributions,
         not hardcoded floors. This adapts to different models and tasks.
         """
         events = trace.events
@@ -278,19 +287,24 @@ class MetacognitiveCore:
         # Compute adaptive floors from session distribution
         confidences = [e.confidence for e in events]
         z_scores = [e.z_score for e in events]
+        surprises = [e.token_surprise for e in events]
 
         conf_mean = sum(confidences) / n
         z_mean = sum(z_scores) / n
+        surp_mean = sum(surprises) / n
 
         conf_var = sum((c - conf_mean) ** 2 for c in confidences) / max(n - 1, 1)
         z_var = sum((z - z_mean) ** 2 for z in z_scores) / max(n - 1, 1)
+        surp_var = sum((s - surp_mean) ** 2 for s in surprises) / max(n - 1, 1)
 
         conf_std = math.sqrt(conf_var) if conf_var > 0 else 0.1
         z_std = math.sqrt(z_var) if z_var > 0 else 0.1
+        surp_std = math.sqrt(surp_var) if surp_var > 0 else 0.1
 
-        # Adaptive floors: "high" = above mean + 1 std of session distribution
+        # Adaptive floors: "high" = above mean + k*std of session distribution
         adaptive_conf_floor = conf_mean + conf_std
         adaptive_z_floor = z_mean + 2 * z_std
+        adaptive_surp_floor = surp_mean + 1.5 * surp_std
 
         # Signal 1: contradictory token ratio (high confidence AND high z-score)
         contradictory = sum(
@@ -300,16 +314,26 @@ class MetacognitiveCore:
         )
         sig1 = contradictory / n
 
-        # Signal 2: SE-based (if available)
+        # Signal 2: surprise-based hallucination risk
+        # High surprise = model generated a token it assigned low probability
+        # This is the neural prediction error — a direct hallucination indicator
+        high_surprise = sum(
+            1 for e in events
+            if e.token_surprise >= adaptive_surp_floor
+        )
+        sig2 = high_surprise / n
+
+        # Signal 3: SE-based (if available)
         if se_result is not None and se_result.n_samples > 0:
             if se_result.is_uncertain:
                 cluster_risk = min(se_result.n_clusters / se_result.n_samples, 1.0)
-                sig2 = 0.5 + 0.5 * cluster_risk
+                sig3 = 0.5 + 0.5 * cluster_risk
             else:
-                sig2 = 0.0
-            return 0.5 * sig1 + 0.5 * sig2
+                sig3 = 0.0
+            return 0.35 * sig1 + 0.30 * sig2 + 0.35 * sig3
         else:
-            return sig1
+            # Without SE: contradiction + surprise equally weighted
+            return 0.5 * sig1 + 0.5 * sig2
 
     def _compute_stability(self, trace: CognitiveTrace) -> str:
         """

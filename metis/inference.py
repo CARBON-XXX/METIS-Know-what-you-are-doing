@@ -16,8 +16,10 @@ import time
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .metis import Metis
 from .core.types import (
@@ -579,10 +581,19 @@ class MetisInference:
                         logits = close_out.logits[:, -1, :]
                         is_thinking = False
 
+            # --- Token surprise: compute from RAW logits before sampling modifies them ---
+            # -log2(p(token)) = prediction error in bits (neuroscience: surprise signal)
+            with torch.no_grad():
+                _log_probs = F.log_softmax(logits.float(), dim=-1)
+
             # --- Token sampling (cognitive-aware) ---
             next_token_id = self._cognitive_sample(
                 logits, signal, temperature, top_p, generated_tokens
             )
+
+            # Attach surprise to signal (after sampling, we know which token was chosen)
+            _token_log_prob = _log_probs[0, next_token_id].item()
+            signal.token_surprise = max(0.0, -_token_log_prob / 0.6931471805599453)  # nats→bits
             
             # --- Max Thinking Tokens: force-close thinking block ---
             # Models not trained for <thinking> protocol (e.g. Qwen 2.5)
@@ -992,8 +1003,9 @@ class MetisInference:
 
         return answer, thinking_text
 
-    # Repetition penalty constants
-    _REP_PENALTY = 1.3         # Penalty factor (1.0 = none, >1.0 = penalize)
+    # Adaptive repetition penalty constants
+    _REP_PENALTY_BASE = 1.2    # Base penalty (mild, for confident tokens)
+    _REP_PENALTY_MAX = 1.5     # Max penalty (strong, for uncertain/looping tokens)
     _REP_PENALTY_WINDOW = 128  # Only penalize tokens in last N generated
 
     def _cognitive_sample(
@@ -1036,21 +1048,28 @@ class MetisInference:
             temperature = base_temperature
             top_p = base_top_p
 
-        # -- 2. Repetition penalty --
-        # Penalize recently generated tokens to prevent loops.
-        # Standard approach: logit > 0 → divide by penalty, logit < 0 → multiply.
-        # This pushes repeated tokens down without distorting the distribution shape.
+        # -- 2. Adaptive repetition penalty --
+        # Penalty scales with cognitive state:
+        #   - Confident (low z): mild penalty (1.2) — don't disrupt valid repetition
+        #   - Uncertain (high z): strong penalty (up to 1.5) — prevent loops
+        #   - Rising momentum: extra +0.05 (entropy accelerating → approaching chaos)
         if generated_tokens:
             recent = generated_tokens[-self._REP_PENALTY_WINDOW:]
             unique_tokens = set(recent)
             if unique_tokens:
+                # Adaptive penalty: base + z-driven boost + momentum boost
+                z_boost = 0.1 * min(max(signal.z_score, 0.0), 3.0)
+                mom_boost = 0.05 if signal.entropy_momentum > 0 else 0.0
+                penalty = min(
+                    self._REP_PENALTY_BASE + z_boost + mom_boost,
+                    self._REP_PENALTY_MAX,
+                )
                 token_ids = torch.tensor(list(unique_tokens), device=logits.device)
                 scores = logits[..., token_ids]
-                # Apply penalty: positive logits shrink, negative logits grow more negative
                 scores = torch.where(
                     scores > 0,
-                    scores / self._REP_PENALTY,
-                    scores * self._REP_PENALTY,
+                    scores / penalty,
+                    scores * penalty,
                 )
                 logits[..., token_ids] = scores
 

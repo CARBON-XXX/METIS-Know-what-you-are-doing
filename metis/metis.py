@@ -170,7 +170,10 @@ class Metis:
         # 3. Detect entropy trend
         trend = self._detect_trend(semantic_entropy)
         
-        # 4. Build signal
+        # 4. Predictive signals (gradient + momentum)
+        entropy_gradient, entropy_momentum = self._controller.get_predictive_signals()
+
+        # 5. Build signal
         signal = CognitiveSignal(
             token_entropy=token_entropy,
             semantic_diversity=semantic_diversity,
@@ -178,6 +181,8 @@ class Metis:
             confidence=confidence,
             decision=decision,
             entropy_trend=trend,
+            entropy_gradient=entropy_gradient,
+            entropy_momentum=entropy_momentum,
             z_score=z_score,
             cusum_alarm=self._controller.stats.get("change_detected", False),
         )

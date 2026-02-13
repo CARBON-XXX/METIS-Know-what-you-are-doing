@@ -1,9 +1,10 @@
 """
 METIS Core Types
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional, List, Callable, Any, Tuple
+from typing import Optional, List, Callable, Any, Tuple, Dict
+import json
 
 
 class Decision(Enum):
@@ -81,6 +82,11 @@ class CognitiveSignal:
     # Introspection (natural language explanation)
     introspection: str = ""
 
+    # -- Predictive cognitive signals --
+    token_surprise: float = 0.0             # -log2(p(sampled_token)) — prediction error
+    entropy_gradient: float = 0.0           # d(entropy)/dt — instantaneous rate of change
+    entropy_momentum: float = 0.0           # EMA of gradient — captures acceleration/deceleration
+
     # -- Internal state (for debugging/visualization) --
     z_score: float = 0.0                    # Current token z-score
     cusum_alarm: bool = False               # Whether CUSUM change-point alarm triggered
@@ -149,6 +155,9 @@ class CognitiveEvent:
     semantic_entropy: float = 0.0
     confidence: float = 0.0
     z_score: float = 0.0
+    token_surprise: float = 0.0
+    entropy_gradient: float = 0.0
+    entropy_momentum: float = 0.0
     decision: Decision = Decision.NORMAL
     epistemic_state: EpistemicState = EpistemicState.LIKELY
     boundary_action: BoundaryAction = BoundaryAction.GENERATE
@@ -179,6 +188,11 @@ class CognitiveTrace:
     mean_confidence: float = 0.0
     entropy_trend_summary: str = "stable"   # Overall trend
     
+    # Surprise statistics (populated by MetacognitiveCore)
+    mean_surprise: float = 0.0
+    peak_surprise: float = 0.0
+    high_surprise_count: int = 0        # Tokens where surprise > 2*mean
+
     def add_event(self, signal: 'CognitiveSignal', step: int) -> None:
         """Create event from CognitiveSignal and append"""
         event = CognitiveEvent(
@@ -187,6 +201,9 @@ class CognitiveTrace:
             semantic_entropy=signal.semantic_entropy,
             confidence=signal.confidence,
             z_score=signal.z_score,
+            token_surprise=signal.token_surprise,
+            entropy_gradient=signal.entropy_gradient,
+            entropy_momentum=signal.entropy_momentum,
             decision=signal.decision,
             epistemic_state=signal.epistemic_state,
             boundary_action=signal.boundary_action,
@@ -195,6 +212,46 @@ class CognitiveTrace:
         )
         self.events.append(event)
         self.total_tokens = len(self.events)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export trace as a serializable dictionary."""
+        def _event_dict(e: CognitiveEvent) -> Dict[str, Any]:
+            return {
+                "step": e.step,
+                "token_entropy": round(e.token_entropy, 4),
+                "semantic_entropy": round(e.semantic_entropy, 4),
+                "confidence": round(e.confidence, 4),
+                "z_score": round(e.z_score, 4),
+                "token_surprise": round(e.token_surprise, 4),
+                "entropy_gradient": round(e.entropy_gradient, 4),
+                "entropy_momentum": round(e.entropy_momentum, 4),
+                "decision": e.decision.value,
+                "epistemic_state": e.epistemic_state.value,
+                "boundary_action": e.boundary_action.value,
+                "entropy_trend": e.entropy_trend,
+                "cusum_alarm": e.cusum_alarm,
+            }
+        return {
+            "query": self.query,
+            "total_tokens": self.total_tokens,
+            "fast_count": self.fast_count,
+            "deep_count": self.deep_count,
+            "hedge_count": self.hedge_count,
+            "seek_count": self.seek_count,
+            "refuse_count": self.refuse_count,
+            "peak_z_score": round(self.peak_z_score, 4),
+            "mean_entropy": round(self.mean_entropy, 4),
+            "mean_confidence": round(self.mean_confidence, 4),
+            "mean_surprise": round(self.mean_surprise, 4),
+            "peak_surprise": round(self.peak_surprise, 4),
+            "high_surprise_count": self.high_surprise_count,
+            "entropy_trend_summary": self.entropy_trend_summary,
+            "events": [_event_dict(e) for e in self.events],
+        }
+
+    def to_json(self, indent: int = 2) -> str:
+        """Export trace as JSON string."""
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
 
 
 @dataclass

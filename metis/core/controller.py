@@ -95,6 +95,12 @@ class AdaptiveController:
         self._lock = threading.Lock()
         self._last_z_score = 0.0  # Cache latest EMA z-score
 
+        # ── Predictive Signals ──
+        self._prev_entropy = c.cold_start_entropy_mean
+        self._entropy_gradient = 0.0     # d(entropy)/dt
+        self._entropy_momentum = 0.0     # EMA of gradient (acceleration)
+        self.MOMENTUM_DECAY = 0.9        # Momentum EMA decay
+
         # ── Consecutive Run Detection ──
         self._consecutive_high = 0
         self._consecutive_threshold = 2
@@ -144,7 +150,15 @@ class AdaptiveController:
             self._entropy_ema += alpha * delta
             self._entropy_emv = (1 - alpha) * (self._entropy_emv + alpha * delta ** 2)
 
-            # 3. Siegmund CUSUM (z-score based on EMA estimates)
+            # 3. Entropy gradient & momentum (predictive signals)
+            self._entropy_gradient = entropy - self._prev_entropy
+            self._entropy_momentum = (
+                self.MOMENTUM_DECAY * self._entropy_momentum
+                + (1 - self.MOMENTUM_DECAY) * self._entropy_gradient
+            )
+            self._prev_entropy = entropy
+
+            # 4. Siegmund CUSUM (z-score based on EMA estimates)
             std_curr = max(math.sqrt(self._entropy_emv), self.Z_SCORE_STD_FLOOR)
             z_score = (entropy - self._entropy_ema) / std_curr
             self._last_z_score = z_score  # Cache, shared with get_z_score()
@@ -152,7 +166,7 @@ class AdaptiveController:
             self._cusum_neg = max(0, self._cusum_neg - z_score - self._cusum_k)
             self._change_detected = (self._cusum_pos > self._cusum_h) or (self._cusum_neg > self._cusum_h)
 
-            # 4. Empirical Bayes
+            # 5. Empirical Bayes
             is_high = z_score > 1.0
             self._alpha_prior = (
                 self.EB_PRIOR_DECAY * self._alpha_prior 
@@ -173,7 +187,7 @@ class AdaptiveController:
                 + (1 - self.EB_POSTERIOR_MOMENTUM) * self._high_entropy_rate
             )
 
-            # 5. Consecutive logic
+            # 6. Consecutive logic
             if is_high:
                 self._consecutive_high += 1
             else:
@@ -184,7 +198,7 @@ class AdaptiveController:
                     self._learn_consecutive()
                 self._consecutive_high = 0
 
-            # 6. Recalibrate thresholds
+            # 7. Recalibrate thresholds
             if self._step_count >= self._config.min_samples:
                 self._recalculate_thresholds()
                 self._is_calibrated = True
@@ -326,6 +340,17 @@ class AdaptiveController:
             "is_calibrated": self._is_calibrated,
             "step_count": self._step_count,
         }
+
+    def get_predictive_signals(self) -> Tuple[float, float]:
+        """
+        Return entropy gradient and momentum for predictive cognitive signals.
+
+        Returns:
+            (entropy_gradient, entropy_momentum)
+            - gradient: instantaneous d(entropy)/dt
+            - momentum: EMA of gradient (captures acceleration/deceleration)
+        """
+        return self._entropy_gradient, self._entropy_momentum
 
     # ═══════════════════════════════════════════════════════════════
     # Internal

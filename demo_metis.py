@@ -208,12 +208,28 @@ class CognitiveVisualizer:
 
         sd = signal.semantic_diversity
         sd_color = C.RED if sd >= 0.3 else C.GREEN
+
+        # Surprise indicator
+        surp = signal.token_surprise
+        surp_color = C.RED if surp > 5.0 else (C.YELLOW if surp > 3.0 else C.GRAY)
+
+        # Momentum arrow: ↑ accelerating, ↓ decelerating, → stable
+        mom = signal.entropy_momentum
+        if mom > 0.1:
+            mom_arrow = f"{C.RED}\u2191{C.RESET}"
+        elif mom < -0.1:
+            mom_arrow = f"{C.GREEN}\u2193{C.RESET}"
+        else:
+            mom_arrow = f"{C.GRAY}\u2192{C.RESET}"
+
         sys.stdout.write(
             f"  {C.GRAY}[{self.token_count:3d}]{C.RESET} "
             f"{dc}{C.BOLD}{di}{C.RESET} "
             f"{C.CYAN}H={signal.semantic_entropy:.2f}{C.RESET} "
             f"z={signal.z_score:+.2f} "
             f"{sd_color}sd={sd:.2f}{C.RESET} "
+            f"{surp_color}S={surp:.1f}{C.RESET}"
+            f"{mom_arrow} "
             f"{cb} "
             f"{sl:>15s} "
             f"{bc}{signal.boundary_action.name:8s}{C.RESET} "
@@ -291,8 +307,11 @@ class CognitiveVisualizer:
                 print(f"  {C.RED}REFUSE: {n_refuse}{C.RESET}")
 
         # Signal Stats
+        avg_surprise = sum(s.token_surprise for s in self.signals) / n
+        peak_surprise = max(s.token_surprise for s in self.signals)
         print(f"\n  {C.BOLD}Signal Statistics:{C.RESET}")
-        print(f"  Avg Entropy: {C.CYAN}{avg_entropy:.3f} bits{C.RESET}")
+        print(f"  Avg Entropy:   {C.CYAN}{avg_entropy:.3f} bits{C.RESET}")
+        print(f"  Avg Surprise:  {C.CYAN}{avg_surprise:.2f} bits{C.RESET}  Peak: {peak_surprise:.2f}")
         print(f"  Avg Confidence: {confidence_bar(avg_conf, 20)} {avg_conf:.1%}")
 
         # Dynamic Thresholds (from last signal)
