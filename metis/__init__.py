@@ -60,6 +60,9 @@ from .core.types import (
 from .core.semantic_entropy import SemanticEntropyEstimator
 from .cognitive.metacognition import MetacognitiveCore
 from .cognitive.phase import CognitivePhase, CognitivePhaseDetector
+from .training.rewards import CognitiveRewardComputer, RewardBreakdown, RewardConfig
+from .training.grpo import CognitiveGRPO
+from .training.dataset import PreferencePairGenerator
 
 __all__ = [
     "Metis",
@@ -82,5 +85,10 @@ __all__ = [
     "InferenceResult",
     "CognitivePhase",
     "CognitivePhaseDetector",
+    "CognitiveRewardComputer",
+    "RewardBreakdown",
+    "RewardConfig",
+    "CognitiveGRPO",
+    "PreferencePairGenerator",
     "__version__",
 ]

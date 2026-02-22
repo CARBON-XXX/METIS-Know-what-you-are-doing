@@ -55,6 +55,7 @@ Modern Large Language Models are **blindly confident**. They answer *"What is th
 | **Hallucination Self-Correction** | Draft-Critique-Refine pipeline with 3-signal risk detection | Contradiction + token surprise + SE → Draft-Critique-Refine |
 | **Curiosity Driver** | Autonomous knowledge gap recording for self-evolution | Runtime confusion detection → gap logging → targeted learning |
 | **Metacognitive Introspection** | Post-generation self-assessment with actionable judgments | Full trace analysis producing epistemic confidence, cognitive load, hallucination risk |
+| **Cognitive Reward Training** | Information-theoretic rewards for GRPO/DPO/KTO — no LLM-as-judge needed | 5-component reward: coherence + calibration + phase quality + epistemic honesty + efficiency |
 
 ---
 
@@ -412,7 +413,77 @@ SE > 0 → semantic disagreement exists (model is genuinely uncertain)
 
 ---
 
-## 📖 API Reference
+## � Training Loop — Cognitive Rewards for GRPO/DPO/KTO
+
+The key architectural shift: **METIS signals are not just for inference — they are training rewards.**
+
+Unlike LLM-as-judge reward models (another LLM scoring outputs), METIS rewards are:
+- **Information-theoretic** — based on entropy, surprise, calibration math
+- **Deterministic** — same trace → same reward (no LLM sampling variance)
+- **Decomposable** — debug exactly which component caused a low score
+- **Free** — no extra LLM inference, computed from existing cognitive trace
+
+### 5-Component Reward
+
+$$R_{\text{total}} = w_1 R_{\text{coh}} + w_2 R_{\text{cal}} + w_3 R_{\text{phase}} + w_4 R_{\text{epist}} + w_5 R_{\text{eff}}$$
+
+| Component | What it measures | Signal source |
+|:---|:---|:---|
+| **R_coh** (Coherence) | Entropy stability — smooth reasoning vs erratic swings | CV(semantic_entropy) |
+| **R_cal** (Calibration) | Confidence-surprise alignment — penalize overconfident hallucination | confidence × excess_surprise |
+| **R_phase** (Phase Quality) | Penalize confusion phases, reward natural reasoning arcs | cognitive_phase transitions |
+| **R_epist** (Epistemic Honesty) | Appropriate uncertainty expression — hedge when unsure | epistemic_state vs confidence |
+| **R_eff** (Efficiency) | Don't overthink simple things — System 1 when appropriate | FAST/DEEP ratio + resolution rate |
+
+Default weights: `w = [0.20, 0.30, 0.20, 0.15, 0.15]`
+
+### Usage: GRPO (Group Relative Policy Optimization)
+
+```python
+from metis.training import CognitiveGRPO, CognitiveRewardComputer
+
+# Online: generate N samples and rank by cognitive reward
+grpo = CognitiveGRPO(inference_fn=my_inference_fn)
+group = grpo.generate_group("Explain quantum entanglement")
+print(group.best.reward.total)        # Best sample's reward
+print(group.reward_spread)            # Signal strength
+
+# Offline: rank pre-computed traces
+group = grpo.rank_traces(prompt, responses, traces)
+grpo.export_groups([group], "grpo_data.jsonl")
+```
+
+### Usage: DPO Preference Pairs
+
+```python
+from metis.training import PreferencePairGenerator
+
+gen = PreferencePairGenerator()
+pairs = gen.from_groups(grpo_groups)   # Best-vs-worst pairs
+gen.export_dpo(pairs, "dpo_train.jsonl")  # TRL-compatible JSONL
+```
+
+### Usage: KTO (Kahneman-Tversky Optimization)
+
+```python
+kto_samples = gen.to_kto(grpo_groups)  # Threshold-based desirable/undesirable
+gen.export_kto(kto_samples, "kto_train.jsonl")
+```
+
+### Why This Matters
+
+Current RLHF pipeline: `Human preference → Reward Model (another LLM) → PPO/DPO`
+
+METIS pipeline: `Cognitive Trace → Information-Theoretic Reward → GRPO/DPO/KTO`
+
+The reward signal is **objective** (entropy doesn't lie), **cheap** (no extra inference), and **interpretable** (decomposed into 5 components). This makes it a complementary or alternative signal to LLM-as-judge, especially for:
+- **Calibration training** — teaching models to be appropriately uncertain
+- **Anti-hallucination training** — penalizing overconfident generation through unknown territory
+- **Efficiency training** — rewarding fast System 1 decisions when appropriate
+
+---
+
+## �📖 API Reference
 
 ### CognitiveSignal
 
@@ -509,6 +580,8 @@ METIS-Know-what-you-are-doing/
 ├── metis/                         # Core METIS package
 │   ├── core/                      # Signal processing layer
 │   ├── cognitive/                 # Cognitive decision layer
+│   ├── training/                  # Cognitive reward training (GRPO/DPO/KTO)
+│   ├── _native/                   # Rust/PyO3 native accelerators
 │   ├── integrations/              # LLM integration hooks
 │   └── inference.py               # Full inference pipeline
 ├── docs/                          # Design philosophy & technical docs
