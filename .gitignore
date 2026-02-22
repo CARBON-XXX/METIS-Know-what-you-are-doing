@@ -53,13 +53,11 @@ metis/v9/
 # Local dev guides
 docs/WSL2_VLLM_SETUP.md
 
-# Local benchmarks & test scripts
+# Local benchmarks
 benchmark_*.py
 benchmark_results/
-test_*.py
 test_*.log
 test_output.txt
-tests/
 
 # Local dev scripts (hardcoded paths)
 scripts/

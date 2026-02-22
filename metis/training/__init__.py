@@ -13,6 +13,11 @@ Core components:
 from .rewards import CognitiveRewardComputer, RewardBreakdown, RewardConfig
 from .grpo import CognitiveGRPO
 from .dataset import PreferencePairGenerator
+from .trl_adapter import (
+    prepare_dpo_dataset,
+    prepare_kto_dataset,
+    MetisRewardFunction,
+)
 
 __all__ = [
     "CognitiveRewardComputer",
@@ -20,4 +25,7 @@ __all__ = [
     "RewardConfig",
     "CognitiveGRPO",
     "PreferencePairGenerator",
+    "prepare_dpo_dataset",
+    "prepare_kto_dataset",
+    "MetisRewardFunction",
 ]
