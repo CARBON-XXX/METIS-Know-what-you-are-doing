@@ -1,0 +1,387 @@
+"""
+METIS Cognitive Reward Computer
+
+Transforms CognitiveTrace into scalar reward signals for RLHF/GRPO/DPO training.
+
+Unlike LLM-as-judge reward models, these rewards are:
+1. Information-theoretic — based on entropy, surprise, calibration
+2. Objective — no subjective human/LLM preference involved
+3. Decomposable — each reward component has clear mathematical meaning
+4. Cheap — no extra LLM inference needed, computed from existing trace
+
+Reward Components:
+═══════════════════════════════════════════════════════════════════
+R_total = w₁·R_coh + w₂·R_cal + w₃·R_phase + w₄·R_epist + w₅·R_eff
+
+R_coh   : Coherence      — entropy stability (low variance = smooth reasoning)
+R_cal   : Calibration     — confidence-surprise alignment (penalize overconfidence)
+R_phase : Phase Quality   — penalize confusion, reward natural reasoning arcs
+R_epist : Epistemic Honor — appropriate uncertainty expression
+R_eff   : Efficiency      — don't overthink simple things
+═══════════════════════════════════════════════════════════════════
+
+All component rewards are normalized to [-1, 1].
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from ..core.types import (
+    CognitiveTrace,
+    CognitiveEvent,
+    Decision,
+    EpistemicState,
+    BoundaryAction,
+)
+
+
+# ─────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class RewardConfig:
+    """Weights and hyperparameters for cognitive reward computation."""
+    # Component weights (must sum to 1.0)
+    w_coherence: float = 0.20
+    w_calibration: float = 0.30
+    w_phase: float = 0.20
+    w_epistemic: float = 0.15
+    w_efficiency: float = 0.15
+
+    # Coherence: entropy CV (coefficient of variation) penalty scale
+    coherence_cv_scale: float = 2.0     # Higher = stricter coherence requirement
+
+    # Calibration: surprise baseline for "overconfident" detection
+    calibration_surprise_baseline: float = 3.0  # bits
+
+    # Phase: confusion penalty weight
+    phase_confusion_penalty: float = 2.0
+    phase_oscillation_penalty: float = 1.0
+
+    # Epistemic: penalty for generating through UNKNOWN state
+    epistemic_unknown_penalty: float = 3.0
+
+    # Efficiency: target FAST ratio (domain-dependent)
+    efficiency_target_fast: float = 0.3
+
+    # Length penalty: slight preference for concise responses
+    length_penalty_threshold: int = 512     # tokens
+    length_penalty_scale: float = 0.001     # per extra token
+
+
+# ─────────────────────────────────────────────────────────
+# Reward Breakdown
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class RewardBreakdown:
+    """Decomposed reward with per-component scores and diagnostics."""
+    # Total reward (weighted sum)
+    total: float = 0.0
+
+    # Component scores (each in [-1, 1])
+    coherence: float = 0.0
+    calibration: float = 0.0
+    phase_quality: float = 0.0
+    epistemic_honesty: float = 0.0
+    efficiency: float = 0.0
+
+    # Length penalty (subtracted from total)
+    length_penalty: float = 0.0
+
+    # Diagnostics
+    diagnostics: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "total": round(self.total, 4),
+            "coherence": round(self.coherence, 4),
+            "calibration": round(self.calibration, 4),
+            "phase_quality": round(self.phase_quality, 4),
+            "epistemic_honesty": round(self.epistemic_honesty, 4),
+            "efficiency": round(self.efficiency, 4),
+            "length_penalty": round(self.length_penalty, 4),
+            **{k: round(v, 4) for k, v in self.diagnostics.items()},
+        }
+
+
+# ─────────────────────────────────────────────────────────
+# Core Reward Computer
+# ─────────────────────────────────────────────────────────
+
+class CognitiveRewardComputer:
+    """
+    Compute cognitive reward from a CognitiveTrace.
+
+    Usage:
+        computer = CognitiveRewardComputer()
+        trace = metis.get_trace()  # After inference
+        reward = computer.compute(trace)
+        print(reward.total, reward.to_dict())
+    """
+
+    def __init__(self, config: Optional[RewardConfig] = None):
+        self._config = config or RewardConfig()
+
+    def compute(self, trace: CognitiveTrace) -> RewardBreakdown:
+        """
+        Compute full reward breakdown from a CognitiveTrace.
+
+        Args:
+            trace: Complete cognitive trace from an inference session
+
+        Returns:
+            RewardBreakdown with total score and per-component breakdown
+        """
+        events = trace.events
+        if len(events) < 2:
+            return RewardBreakdown(diagnostics={"error": "too_few_events"})
+
+        cfg = self._config
+        breakdown = RewardBreakdown()
+
+        # Compute each component
+        breakdown.coherence = self._reward_coherence(events)
+        breakdown.calibration = self._reward_calibration(events)
+        breakdown.phase_quality = self._reward_phase_quality(events)
+        breakdown.epistemic_honesty = self._reward_epistemic_honesty(events)
+        breakdown.efficiency = self._reward_efficiency(events, trace)
+
+        # Length penalty
+        n = len(events)
+        if n > cfg.length_penalty_threshold:
+            breakdown.length_penalty = (n - cfg.length_penalty_threshold) * cfg.length_penalty_scale
+
+        # Weighted total
+        breakdown.total = (
+            cfg.w_coherence * breakdown.coherence
+            + cfg.w_calibration * breakdown.calibration
+            + cfg.w_phase * breakdown.phase_quality
+            + cfg.w_epistemic * breakdown.epistemic_honesty
+            + cfg.w_efficiency * breakdown.efficiency
+            - breakdown.length_penalty
+        )
+
+        return breakdown
+
+    # ═══════════════════════════════════════════════════════
+    # R₁: Coherence — entropy stability
+    # ═══════════════════════════════════════════════════════
+
+    def _reward_coherence(self, events: List[CognitiveEvent]) -> float:
+        """
+        Coherence reward: penalize erratic entropy swings.
+
+        Metric: Coefficient of Variation (CV) of semantic entropy.
+        CV = std(H) / mean(H). Low CV = smooth, coherent generation.
+
+        Mapping: R_coh = 1 - scale * CV, clamped to [-1, 1]
+
+        Mathematical justification:
+        - Coherent text has stable entropy (model confidently generates each token)
+        - Hallucination / confusion causes entropy spikes
+        - CV is scale-invariant (works across different models/domains)
+        """
+        entropies = [e.semantic_entropy for e in events]
+        mean_h = sum(entropies) / len(entropies)
+
+        if mean_h < 1e-6:
+            return 1.0  # Near-zero entropy = perfectly confident
+
+        var_h = sum((h - mean_h) ** 2 for h in entropies) / len(entropies)
+        std_h = math.sqrt(var_h)
+        cv = std_h / mean_h
+
+        reward = 1.0 - self._config.coherence_cv_scale * cv
+        return max(-1.0, min(1.0, reward))
+
+    # ═══════════════════════════════════════════════════════
+    # R₂: Calibration — confidence-surprise alignment
+    # ═══════════════════════════════════════════════════════
+
+    def _reward_calibration(self, events: List[CognitiveEvent]) -> float:
+        """
+        Calibration reward: penalize overconfident hallucination.
+
+        Core idea: if model is confident (high p(token)) but surprise is high
+        (actually chose a low-probability token from the full distribution),
+        something is wrong — the model is overconfident about uncertain content.
+
+        Metric: -mean(confidence * max(0, surprise - baseline))
+        - Only penalizes when surprise exceeds baseline (normal surprise is fine)
+        - Weighted by confidence (only bad when model is also confident)
+
+        This is a novel reward signal that captures the gap between
+        token-level confidence and sequence-level prediction error.
+        """
+        baseline = self._config.calibration_surprise_baseline
+        n = len(events)
+
+        # Compute miscalibration: confidence * excess_surprise
+        miscal_sum = 0.0
+        miscal_count = 0
+        for e in events:
+            excess = e.token_surprise - baseline
+            if excess > 0:
+                miscal_sum += e.confidence * excess
+                miscal_count += 1
+
+        if miscal_count == 0:
+            return 1.0  # No miscalibration events
+
+        # Normalize by total events (not just miscalibrated ones)
+        # This way, a few miscalibrated tokens in a long response aren't catastrophic
+        mean_miscal = miscal_sum / n
+
+        # Map to [-1, 1]: 0 miscalibration → +1, high miscalibration → -1
+        # Empirically, mean_miscal > 0.5 is very bad
+        reward = 1.0 - 4.0 * mean_miscal
+        return max(-1.0, min(1.0, reward))
+
+    # ═══════════════════════════════════════════════════════
+    # R₃: Phase Quality — cognitive phase health
+    # ═══════════════════════════════════════════════════════
+
+    def _reward_phase_quality(self, events: List[CognitiveEvent]) -> float:
+        """
+        Phase quality reward: penalize confusion and phase oscillation.
+
+        Desirable pattern: fluent → recall → reasoning → fluent (natural arc)
+        Undesirable: confusion (model stuck), rapid phase oscillation
+
+        Components:
+        1. Confusion ratio penalty: fraction of tokens in "confusion" phase
+        2. Oscillation penalty: number of phase transitions / total tokens
+           (Rapid switching indicates the model can't settle into a reasoning mode)
+        """
+        n = len(events)
+        cfg = self._config
+
+        # 1. Confusion ratio
+        confusion_count = sum(1 for e in events if e.cognitive_phase == "confusion")
+        confusion_ratio = confusion_count / n
+
+        # 2. Phase oscillation: count transitions between different phases
+        transitions = 0
+        for i in range(1, n):
+            if events[i].cognitive_phase != events[i - 1].cognitive_phase:
+                transitions += 1
+        oscillation_rate = transitions / max(n - 1, 1)
+
+        # Reward: start at 1.0, subtract penalties
+        reward = 1.0
+        reward -= cfg.phase_confusion_penalty * confusion_ratio
+        reward -= cfg.phase_oscillation_penalty * max(0, oscillation_rate - 0.3)
+        # Allow up to 30% transitions as normal (phases do change naturally)
+
+        return max(-1.0, min(1.0, reward))
+
+    # ═══════════════════════════════════════════════════════
+    # R₄: Epistemic Honesty — appropriate uncertainty handling
+    # ═══════════════════════════════════════════════════════
+
+    def _reward_epistemic_honesty(self, events: List[CognitiveEvent]) -> float:
+        """
+        Epistemic honesty reward: model should express uncertainty appropriately.
+
+        Penalize:
+        - Generating confidently through UNKNOWN epistemic state
+          (model should hedge or seek information, not plow through)
+        - High confidence when boundary guard is in HEDGE/REFUSE state
+
+        Reward:
+        - HEDGE action when actually uncertain (appropriate caution)
+        - High confidence when LIKELY/CONFIDENT (justified confidence)
+
+        This teaches the model to be epistemically honest — a key property
+        that LLM-as-judge reward models struggle to capture.
+        """
+        n = len(events)
+        cfg = self._config
+
+        honest_count = 0
+        dishonest_penalty = 0.0
+
+        for e in events:
+            is_uncertain = e.epistemic_state in (
+                EpistemicState.UNCERTAIN,
+                EpistemicState.UNKNOWN,
+            )
+            is_confident_output = e.confidence > 0.7
+
+            if is_uncertain and is_confident_output:
+                # Bad: model is confident but epistemic state says uncertain
+                weight = cfg.epistemic_unknown_penalty if e.epistemic_state == EpistemicState.UNKNOWN else 1.0
+                dishonest_penalty += weight
+            elif is_uncertain and e.boundary_action in (
+                BoundaryAction.HEDGE,
+                BoundaryAction.REFUSE,
+            ):
+                # Good: model is uncertain AND boundary guard triggered appropriate action
+                honest_count += 1
+            elif not is_uncertain and is_confident_output:
+                # Good: justified confidence
+                honest_count += 1
+            # Else: neutral (low confidence on likely state — slightly underconfident but not harmful)
+
+        honest_ratio = honest_count / max(n, 1)
+        dishonest_ratio = dishonest_penalty / max(n, 1)
+
+        reward = honest_ratio - dishonest_ratio
+        return max(-1.0, min(1.0, reward))
+
+    # ═══════════════════════════════════════════════════════
+    # R₅: Efficiency — cognitive resource allocation
+    # ═══════════════════════════════════════════════════════
+
+    def _reward_efficiency(
+        self, events: List[CognitiveEvent], trace: CognitiveTrace
+    ) -> float:
+        """
+        Efficiency reward: appropriate cognitive resource allocation.
+
+        Penalize:
+        - Too much DEEP reasoning on simple content (overthinking)
+        - DEEP reasoning that doesn't resolve (futile deliberation)
+
+        Reward:
+        - High FAST ratio when no boundary alarms follow (quick + correct)
+        - DEEP reasoning that leads to resolution (useful deliberation)
+
+        This teaches the model to be "thinking fast and slow" appropriately —
+        System 1 for easy stuff, System 2 only when genuinely needed.
+        """
+        n = len(events)
+        if n == 0:
+            return 0.0
+
+        fast_count = sum(1 for e in events if e.decision == Decision.FAST)
+        deep_count = sum(1 for e in events if e.decision == Decision.DEEP)
+        fast_ratio = fast_count / n
+        deep_ratio = deep_count / n
+
+        # Count DEEP tokens followed by resolution (entropy drops after DEEP)
+        resolved_deep = 0
+        for i in range(len(events) - 1):
+            if events[i].decision == Decision.DEEP:
+                # Check if next 3 tokens show entropy decrease
+                lookahead = events[i + 1 : min(i + 4, len(events))]
+                if lookahead and any(
+                    e.token_entropy < events[i].token_entropy * 0.7
+                    for e in lookahead
+                ):
+                    resolved_deep += 1
+
+        deep_resolution_rate = resolved_deep / max(deep_count, 1)
+
+        # Reward = FAST efficiency + DEEP resolution rate - overthinking penalty
+        target = self._config.efficiency_target_fast
+        fast_bonus = min(1.0, fast_ratio / max(target, 0.01))  # Reward reaching target
+        deep_penalty = max(0, deep_ratio - 0.3)  # Penalize >30% DEEP
+        resolution_bonus = deep_resolution_rate * 0.5  # Bonus for useful DEEP
+
+        reward = 0.5 * fast_bonus + resolution_bonus - deep_penalty
+        return max(-1.0, min(1.0, reward))
