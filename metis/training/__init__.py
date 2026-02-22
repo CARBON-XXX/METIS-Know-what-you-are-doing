@@ -18,6 +18,7 @@ from .trl_adapter import (
     prepare_kto_dataset,
     MetisRewardFunction,
 )
+from .generator import MetisGenerator
 
 __all__ = [
     "CognitiveRewardComputer",
@@ -28,4 +29,5 @@ __all__ = [
     "prepare_dpo_dataset",
     "prepare_kto_dataset",
     "MetisRewardFunction",
+    "MetisGenerator",
 ]
